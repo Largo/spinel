@@ -521,17 +521,16 @@ The runtime is POSIX-flavoured and targets POSIX platforms:
 | Linux (x86-64, arm64) | Supported | gcc, clang |
 | macOS (Intel, Apple Silicon) | Supported | clang |
 | *BSD | Expected to work; not in CI | clang |
-| Windows | Use [WSL](https://learn.microsoft.com/windows/wsl/) (builds/runs as Linux) | gcc, clang |
+| Windows (x64) | Supported natively (MSYS2 MinGW-w64, UCRT); see [docs/windows.md](docs/windows.md) | gcc |
 
-Every PR runs `ubuntu-latest / gcc`, `ubuntu-latest / clang`, and
-`macos-latest / clang` jobs end-to-end (parser build, codegen build,
-full test + benchmark suites). Native Windows (MinGW / MSVC) is not
-supported: the runtime relies on POSIX assumptions (`pthread` for the
-threaded runtime, `<sys/mman.h>` for the regexp engine's executable
-buffers, GCC's `__attribute__((cleanup))` for the GC root stack, and
-GCC/Clang inline assembly for the Fiber context switch). Windows users
-run Spinel under WSL, where it builds and runs as a native Linux
-toolchain.
+Every PR runs an `ubuntu-latest / clang` job end-to-end; pushes to master
+add `ubuntu-latest / gcc`, `macos-latest / clang`, a 32-bit gcc lane,
+wasm32-wasi and `windows-latest / mingw-w64 gcc`. The runtime is written
+against POSIX; on Windows the POSIX surface MinGW leaves out is supplied by
+`lib/win32/` (`posix_spawn` over `CreateProcess`, `mmap` over
+`VirtualAlloc`, sockets as file descriptors over winsock, a Windows x64
+fiber switch), the same arrangement `lib/wasi/` is for WebAssembly, so the
+POSIX build is unchanged. WSL also runs the Linux build.
 
 ## Limitations
 

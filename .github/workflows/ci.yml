@@ -368,3 +368,96 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats
+
+  # Native Windows: MSYS2's MinGW-w64 gcc against the UCRT, with the runtime
+  # and the compiler built over lib/win32 -- the POSIX surface MinGW leaves
+  # out, as lib/wasi is for wasm32-wasi (see lib/win32/sp_win32.h). The lane
+  # is what keeps the port from rotting: a POSIX call the shim does not
+  # answer is a link error here, and a test that asserts POSIX-only
+  # behaviour says `# spinel: posix -- <why>` and is not run (win32.mk).
+  #
+  # master pushes only, as the other non-PR lanes. Every corpus test is a
+  # build -- spinel, gcc, a static link, a run -- and each of those costs
+  # more on Windows than on Linux (process creation, the static link, the
+  # MSYS2 tools the harness runs), so the corpus is split across three jobs
+  # and the compiles go through sccache, its store carried between runs as
+  # the posix lanes carry theirs. Defender's real-time scan of every
+  # compiler process and every test binary dominated the old MinGW job, so
+  # it is switched off for the run.
+  windows:
+    name: windows-latest / mingw-w64 gcc (ucrt64) (${{ matrix.shard }}/3)
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}\.sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
+    steps:
+      - name: Disable Defender real-time monitoring
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true }
+          catch { Write-Host "Could not disable Defender real-time monitoring: $_" }
+
+      # The corpus and its .expected files are LF; a CRLF checkout would put
+      # a \r into every heredoc a test prints.
+      - name: Check out with LF line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+
+      # MSYS2's own sccache, so it is on the shell's PATH (common.mk wraps
+      # CC in it when it finds one) without inheriting the runner's.
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          cache: true
+          install: >-
+            make
+            diffutils
+            curl
+            tar
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ruby
+            mingw-w64-ucrt-x86_64-sccache
+
+      # As in the posix lanes: the key never matches, so the post step saves
+      # this run's store; the restore key takes the newest earlier one.
+      - name: Restore the sccache store
+        uses: actions/cache@v6
+        with:
+          path: .sccache
+          key: sccache-windows-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: sccache-windows-${{ matrix.shard }}-
+
+      - name: Show toolchain
+        run: |
+          uname -a
+          gcc --version | head -1
+          make --version | head -1
+          sccache --version
+          sccache --start-server
+
+      - name: Fetch libprism sources
+        run: make deps
+
+      - name: Build (compiler, runtime, tools)
+        run: make -j$(nproc) all
+
+      - name: Run the test corpus
+        run: make -j$(nproc) test-corpus TEST_SHARD=${{ matrix.shard }}/3 OPT=-O1
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
