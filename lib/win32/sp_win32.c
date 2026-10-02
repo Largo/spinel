@@ -2760,11 +2760,16 @@ int madvise(void *addr, size_t len, int advice) {
   ReleaseSRWLockShared(&sp_w32_maps_lock);
   if (i < 0) return 0;
   if (advice == MADV_FREE) { VirtualAlloc(a, (size_t)(e - a), MEM_RESET, PAGE_NOACCESS); return 0; }
-  /* DONTNEED: the next read sees zeros, as Linux promises for a private
-     anonymous mapping. A lazy mapping recommits on the touch; an eager one
-     recommits now. */
+  /* DONTNEED: the pages go back and the next read sees zeros, as Linux
+     promises for a private anonymous mapping. Decommitted and committed
+     again at once: a committed page no one has touched costs no memory and
+     reads zero, and leaving it decommitted would send the next touch
+     through the lazy-commit handler -- a user-mode exception per page,
+     which a collector that hands chunks back every cycle paid thousands of
+     times a second. */
+  (void)lazy;
   VirtualFree(a, (size_t)(e - a), MEM_DECOMMIT);
-  if (!lazy) VirtualAlloc(a, (size_t)(e - a), MEM_COMMIT, prot);
+  VirtualAlloc(a, (size_t)(e - a), MEM_COMMIT, prot);
   return 0;
 }
 
