@@ -368,3 +368,66 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats
+
+  # Native Windows: MSYS2's MinGW-w64 gcc against the UCRT, with the runtime
+  # and the compiler built over lib/win32 -- the POSIX surface MinGW leaves
+  # out, as lib/wasi is for wasm32-wasi (see lib/win32/sp_win32.h). The lane
+  # is what keeps the port from rotting: a POSIX call the shim does not
+  # answer is a link error here, and a test that asserts POSIX-only
+  # behaviour says `# spinel: posix -- <why>` and is not run (Makefile).
+  #
+  # master pushes only, as the other non-PR lanes. Defender's real-time scan
+  # of every compiler process and every test binary dominated the old MinGW
+  # job, so it is switched off for the run.
+  windows:
+    name: windows-latest / mingw-w64 gcc (ucrt64)
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Disable Defender real-time monitoring
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true }
+          catch { Write-Host "Could not disable Defender real-time monitoring: $_" }
+
+      # The corpus and its .expected files are LF; a CRLF checkout would put
+      # a \r into every heredoc a test prints.
+      - name: Check out with LF line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          cache: true
+          install: >-
+            make
+            diffutils
+            curl
+            tar
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ruby
+
+      - name: Show toolchain
+        run: |
+          uname -a
+          gcc --version | head -1
+          make --version | head -1
+
+      - name: Fetch libprism sources
+        run: make deps
+
+      - name: Build (compiler, runtime, tools)
+        run: make -j$(nproc) all
+
+      - name: Run the test corpus
+        run: make -j$(nproc) test-corpus OPT=-O1
