@@ -696,7 +696,16 @@ const char*sp_str_repeat(const char*s,sp_int n){SP_GC_ROOT_STR(s);
   size_t total=(size_t)n*l;
   sp_str_check_size(0,total);
   char*r=sp_str_alloc_raw(total+1);
-  for(sp_int i=0;i<n;i++)memcpy(r+(l*i),s,l);
+  /* by doubling: one copy of s, then what is written so far, again -- a
+     log2(n) count of copies, where a copy per repetition was n calls of an
+     l-byte memcpy ("pad" * 150_000 made 150,000 of them) -- until a copy
+     reaches 16 KB (or one s, when that is longer), after which that chunk
+     at the front is copied on: it stays in cache, as s did, where doubling
+     on would re-read megabytes of output (a 100 KB s repeated was 10% slower
+     than one copy per repetition) */
+  memcpy(r,s,l);
+  size_t cap=l>16384?l:16384-16384%l;
+  for(size_t done=l;done<total;){size_t c=done<total-done?done:total-done;if(c>cap)c=cap;memcpy(r+done,r,c);done+=c;}
   r[total]=0;
   sp_str_set_len(r,total);
   return sp_str_bin_from(r,s);
