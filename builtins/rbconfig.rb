@@ -8,14 +8,15 @@ module RbConfig
   __darwin = __plat.include?("darwin")
   __cpu = __plat.split("-").first
   __cpu = "arm64" if __darwin && __cpu == "aarch64"
-  __os = __darwin ? "darwin" : (__plat.include?("linux") ? "linux" : __plat.split("-").last)
+  __win = __plat.include?("mingw")
+  __os = __darwin ? "darwin" : (__plat.include?("linux") ? "linux" : (__win ? "mingw32" : __plat.split("-").last))
   CONFIG = {
     "host_os" => __os, "target_os" => __os, "build_os" => __os,
     "host_cpu" => __cpu, "target_cpu" => __cpu, "build_cpu" => __cpu,
     "arch" => "#{__cpu}-#{__os}", "ruby_version" => RUBY_VERSION.split(".")[0, 2].join(".") + ".0",
     "MAJOR" => RUBY_VERSION.split(".")[0], "MINOR" => RUBY_VERSION.split(".")[1],
-    "EXEEXT" => "", "DLEXT" => (__darwin ? "bundle" : "so"),
-    "SOEXT" => (__darwin ? "dylib" : "so"), "LIBEXT" => "a",
+    "EXEEXT" => (__win ? ".exe" : ""), "DLEXT" => (__darwin ? "bundle" : "so"),
+    "SOEXT" => (__darwin ? "dylib" : (__win ? "dll" : "so")), "LIBEXT" => "a",
     "host" => __plat, "target" => __plat, "ruby_install_name" => "ruby"
   }
 

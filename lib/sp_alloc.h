@@ -144,6 +144,19 @@ static inline sp_int sp_str_chilled_sym(const char *s) {
    GNU's `s ?: sp_str_empty` */
 static inline const char *sp_str_or_empty(const char *s) { return s ? s : sp_str_empty; }
 
+/* The length of a path's root, 0 for a relative path: "/" here, and on
+   Windows a drive's "C:/" too (or "C:\"), the root CRuby there answers
+   paths under. The lexical path helpers (File.expand_path, Dir.glob,
+   File.absolute_path?) keep a root as it is and work on what follows. */
+static inline size_t sp_path_root_len(const char *p) {
+  if (!p) return 0;
+#if defined(_WIN32)
+  if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':' && (p[2] == '/' || p[2] == '\\'))
+    return 3;
+#endif
+  return p[0] == '/' ? 1 : 0;
+}
+
 /* UTF-8 char-length cache. Shared (extern) so sp_str_sweep flushes the same
    table the length helpers in spinel_rt.h populate: a per-TU split would leave
    the generated TU's cache pointing at strings the archive-side sweep already

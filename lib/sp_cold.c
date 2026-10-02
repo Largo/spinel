@@ -22,6 +22,9 @@
 #include "sp_alloc.h"   /* sp_str_alloc / sp_str_set_len / sp_raise_cls */
 #include "sp_array.h"   /* sp_StrArray for Dir.glob */
 #include <dirent.h>
+#if defined(_WIN32) || defined(SP_USE_POSIX_SPAWN)
+#include <spawn.h>
+#endif
 #include <fnmatch.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -175,6 +178,15 @@ const char *sp_file_expand_path(const char *path, const char *base) {
   char raw[8192];
   char cwd[4096];
   const char *home = getenv("HOME");
+#if defined(_WIN32)
+  /* Windows: a backslash separates too, and the answer spells it as a
+     slash, as CRuby's does; the home is %USERPROFILE% when HOME is unset */
+  char pbuf[4096], bbuf[4096], hbuf[4096];
+  if (!home) home = getenv("USERPROFILE");
+  if (home) { snprintf(hbuf, sizeof hbuf, "%s", home); for (char *c = hbuf; *c; c++) if (*c == '\\') *c = '/'; home = hbuf; }
+  if (path) { snprintf(pbuf, sizeof pbuf, "%s", path); for (char *c = pbuf; *c; c++) if (*c == '\\') *c = '/'; path = pbuf; }
+  if (base) { snprintf(bbuf, sizeof bbuf, "%s", base); for (char *c = bbuf; *c; c++) if (*c == '\\') *c = '/'; base = bbuf; }
+#endif
   if (!home) home = "";
   if (!path) path = "";
 
@@ -186,7 +198,7 @@ const char *sp_file_expand_path(const char *path, const char *base) {
   if (path[0] == '~' && (path[1] == '\0' || path[1] == '/')) {
     snprintf(raw, sizeof(raw), "%.4000s%.4000s", home, path + 1);
   }
-  else if (path[0] == '/') {
+  else if (sp_path_root_len(path)) {
     snprintf(raw, sizeof(raw), "%.4000s", path);
   }
   else {
@@ -197,7 +209,7 @@ const char *sp_file_expand_path(const char *path, const char *base) {
         snprintf(basebuf, sizeof(basebuf), "%.4000s%.4000s", home, base + 1);
         b = basebuf;
       }
-      else if (base[0] == '/') {
+      else if (sp_path_root_len(base)) {
         b = base;
       }
       else {
@@ -216,13 +228,28 @@ const char *sp_file_expand_path(const char *path, const char *base) {
   /* Normalize: walk segments, collapsing `.`/`..`/`//`. seg_start[k]
      records the output length to roll back to when a `..` pops the
      k-th kept segment. */
+#if defined(_WIN32)
+  /* "/x" is the current drive's: Windows has no root above the drives */
+  if (raw[0] == '/' && raw[1] != '/') {
+    char drv[4096];
+    if (getcwd(drv, sizeof drv) && sp_path_root_len(drv) == 3) {
+      char t[8192];
+      snprintf(t, sizeof t, "%c:%.8000s", drv[0], raw);
+      snprintf(raw, sizeof raw, "%s", t);
+    }
+  }
+#endif
   size_t rawlen = strlen(raw);
   char *out = sp_str_alloc(rawlen + 1);
   size_t seg_start[1024];
   int nseg = 0;
   size_t olen = 0;
+  /* the root as it is ("/", or a drive's "C:/"), then the segments */
+  size_t rootn = sp_path_root_len(raw);
+  if (rootn > 1) { memcpy(out, raw, rootn - 1); olen = rootn - 1; }
   out[olen++] = '/';
-  const char *p = raw;
+  size_t root_end = olen;
+  const char *p = raw + (rootn ? rootn : 0);
   while (*p) {
     if (*p == '/') { p++; continue; }
     const char *q = p;
@@ -236,7 +263,7 @@ const char *sp_file_expand_path(const char *path, const char *base) {
     }
     else {
       size_t mark = olen;
-      if (olen > 1) out[olen++] = '/';
+      if (olen > root_end) out[olen++] = '/';
       memcpy(out + olen, p, slen);
       olen += slen;
       if (nseg < 1024) seg_start[nseg++] = mark;
@@ -397,6 +424,15 @@ static int sp_glob_exists(const char *path) {
    walk split the pattern at its LAST slash and opendir'd the part before it, so
    a wildcard middle component opened a directory literally named with it,
    and found nothing. */
+/* The separator between a directory the walk is in and a name under it:
+   none at a root that already ends in one ("/", or "C:/" on Windows), where
+   another would spell "//tmp" -- a different name to a POSIX system that
+   reads a leading "//" its own way, and to the Windows shim's /tmp. */
+static const char *sp_glob_sep(const char *fsdir) {
+  size_t n = strlen(fsdir);
+  return (n == 0 || fsdir[n - 1] == '/') ? "" : "/";
+}
+
 static void sp_glob_walk(const char *fsdir, const char *outprefix,
                          char **comps, int ncomp, int ci, sp_StrArray *a) {
   if (ci >= ncomp) return;
@@ -421,7 +457,7 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
       const char *name = e->d_name;
       if (name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0))) continue;
       if (name[0] == '.' && !sp_glob_dotmatch) continue;
-      snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, fsdir[0] ? "/" : "", name);
+      snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, sp_glob_sep(fsdir), name);
       snprintf(outpath, sizeof outpath, "%s%s", outprefix, name);
       /* A trailing ** answers every entry beneath it, directories included --
          `Dir.glob("a/**")` is ["a/b", "a/top.rs"] in CRuby. */
@@ -443,7 +479,7 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
 
   if (!sp_glob_has_meta(comp)) {
     /* A literal component needs no readdir: ask the filesystem directly. */
-    snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, fsdir[0] ? "/" : "", comp);
+    snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, sp_glob_sep(fsdir), comp);
     snprintf(outpath, sizeof outpath, "%s%s", outprefix, comp);
     if (last) { if (sp_glob_exists(fspath)) sp_glob_push(a, outpath); return; }
     if (sp_glob_is_dir(fspath)) {
@@ -464,7 +500,7 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
     if (name[0] == '.' && name[1] == '.' && name[2] == 0) continue;
     if (name[0] == '.' && name[1] == 0 && !sp_glob_dotmatch) continue;
     if (!sp_glob_comp_match(comp, name)) continue;
-    snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, fsdir[0] ? "/" : "", name);
+    snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, sp_glob_sep(fsdir), name);
     snprintf(outpath, sizeof outpath, "%s%s", outprefix, name);
     if (last) { sp_glob_push(a, outpath); continue; }
     if (sp_glob_is_dir(fspath)) {
@@ -511,8 +547,12 @@ static void sp_dir_glob_one(const char *pattern, sp_StrArray *a) {
   size_t blen = strlen(buf);
   int dir_only = blen > 1 && buf[blen - 1] == '/';
   if (dir_only) buf[blen - 1] = 0;
-  int absolute = (buf[0] == '/');
-  char *p = buf + (absolute ? 1 : 0);
+  size_t rootn = sp_path_root_len(buf);
+  int absolute = rootn > 0;
+  /* the root a walk starts from: "/", or a drive's "C:/" */
+  char root[4] = "/";
+  if (rootn > 1) { memcpy(root, buf, rootn); root[rootn] = 0; root[rootn - 1] = '/'; }
+  char *p = buf + rootn;
   for (char *tok = p; ncomp < 64; ) {
     char *sl = strchr(tok, '/');
     if (sl) *sl = 0;
@@ -528,7 +568,7 @@ static void sp_dir_glob_one(const char *pattern, sp_StrArray *a) {
   if (dir_only && ncomp > 0 && strcmp(comps[ncomp - 1], "**") == 0 && ncomp < 64) {
     comps[ncomp++] = dstar;   /* ** + / + *  -- every entry at every depth */
   }
-  if (!dir_only) { sp_glob_walk(absolute ? "/" : "", absolute ? "/" : "", comps, ncomp, 0, a); return; }
+  if (!dir_only) { sp_glob_walk(absolute ? root : "", absolute ? root : "", comps, ncomp, 0, a); return; }
   /* A symlink to a directory IS one of the answers for a non-recursive form
      ("*" + SEP lists it) and is not for the recursive one, which does not
      follow links at all -- the same split the walk itself makes. */
@@ -536,7 +576,7 @@ static void sp_dir_glob_one(const char *pattern, sp_StrArray *a) {
     for (int i = 0; i < ncomp; i++) if (strcmp(comps[i], "**") == 0) recursive = 1;
     sp_StrArray *tmp = sp_StrArray_new();
     SP_GC_ROOT(tmp);
-    sp_glob_walk(absolute ? "/" : "", absolute ? "/" : "", comps, ncomp, 0, tmp);
+    sp_glob_walk(absolute ? root : "", absolute ? root : "", comps, ncomp, 0, tmp);
     for (sp_int i = 0; i < tmp->len; i++) {
       const char *e = tmp->data[i];
       /* lstat, for the reason the recursive walk uses it: a symlink to a
@@ -886,6 +926,11 @@ sp_Time sp_file_birthtime(const char *path) {SP_GC_ROOT_STR(path);  /* (#2985) *
     return (sp_Time){(int64_t)stx.stx_btime.tv_sec, (int32_t)stx.stx_btime.tv_nsec, 0};
   sp_raise_cls("NotImplementedError", "birthtime() function is unimplemented on this filesystem");
   return (sp_Time){0, 0, 0};
+#elif defined(_WIN32)
+  /* the creation time Windows keeps (lib/win32's struct stat) */
+  struct stat st;
+  if (stat(path, &st) == -1) sp_file_raise_errno("rb_file_s_birthtime", path);
+  return (sp_Time){(int64_t)st.st_birthtim.tv_sec, (int32_t)st.st_birthtim.tv_nsec, 0};
 #else
   sp_raise_cls("NotImplementedError", "birthtime() function is unimplemented");
   return (sp_Time){0, 0, 0};
@@ -1202,6 +1247,23 @@ const char *sp_backtick(const char *cmd) {SP_GC_ROOT_STR(cmd);
   int fds[2];
   if (pipe(fds) != 0) { sp_last_status = -1; return sp_str_empty; }
   fflush(NULL);
+#if defined(_WIN32) || defined(SP_USE_POSIX_SPAWN)
+  /* posix_spawn where there is no fork (see sp_process.c) */
+  pid_t pid = 0;
+  {
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    if (fds[1] != 1) { posix_spawn_file_actions_adddup2(&fa, fds[1], 1); posix_spawn_file_actions_addclose(&fa, fds[1]); }
+    char *av[] = { (char *)"sh", (char *)"-c", (char *)cmd, NULL };
+#if !defined(_WIN32)
+    extern char **environ;   /* the CRT declares it on Windows */
+#endif
+    int rc = posix_spawn(&pid, "/bin/sh", &fa, NULL, av, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) { close(fds[0]); close(fds[1]); sp_last_status = 127 << 8; return sp_str_empty; }
+  }
+#else
   pid_t pid = fork();
   if (pid < 0) { close(fds[0]); close(fds[1]); sp_last_status = -1; return sp_str_empty; }
   if (pid == 0) {
@@ -1210,6 +1272,7 @@ const char *sp_backtick(const char *cmd) {SP_GC_ROOT_STR(cmd);
     execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
     _exit(127);
   }
+#endif
   close(fds[1]);
   size_t cap = 4096, len = 0;
   char *buf = (char *)malloc(cap);
@@ -1940,7 +2003,7 @@ const char *sp_file_realdirpath(const char *path) {
   if (strcmp(buf, "/") == 0) return sp_sprintf("/%s", base);
   return sp_sprintf("%s/%s", buf, base);
 }
-sp_bool sp_file_absolute_path_p(const char *path) { return path && path[0] == '/'; }  /* (#2988) */
+sp_bool sp_file_absolute_path_p(const char *path) { return sp_path_root_len(path) > 0; }  /* (#2988) */
 sp_int sp_file_chown(const char *path, sp_int uid, sp_int gid) {SP_GC_ROOT_STR(path);  /* -1 leaves that id unchanged; returns the path count (#2987) */
   if (chown(path ? path : "", (uid_t)uid, (gid_t)gid) != 0)
     sp_raise_cls("Errno::ENOENT", sp_sprintf("No such file or directory - %s", path ? path : ""));
@@ -2394,6 +2457,9 @@ const char *sp_file_dirname(const char *path) {SP_GC_ROOT_STR(path);
   const char *s = strrchr(path, '/');
   if (!s) { char *r = sp_str_alloc(1); r[0] = '.'; r[1] = 0; return r; }
   if (s == path) { char *r = sp_str_alloc(1); r[0] = '/'; r[1] = 0; return r; }
+  /* the separator of a drive's root ("C:/x") stays: the dirname is the root */
+  { size_t rn = sp_path_root_len(path);
+    if (rn > 1 && (size_t)(s - path) < rn) { char *r = sp_str_alloc((sp_int)rn); memcpy(r, path, rn); r[rn] = 0; return r; } }
   size_t n = (size_t)(s - path);
   char *buf = sp_str_alloc(n);
   memcpy(buf, path, n); buf[n] = 0;

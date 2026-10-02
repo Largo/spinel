@@ -9,7 +9,7 @@ module Gem
   class LoadError < ::LoadError; end
   class MissingSpecError < LoadError; end
 
-  def self.win_platform? = false
+  def self.win_platform? = RUBY_PLATFORM.include?("mingw")
   def self.java_platform? = false
   def self.ruby_version = Version.new(RUBY_VERSION)
   def self.platforms = []
