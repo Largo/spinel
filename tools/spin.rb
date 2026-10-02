@@ -2433,6 +2433,33 @@ end
 
 # --- main --------------------------------------------------------------------
 
+# Native Windows: spin's build steps are POSIX shell command lines, and a
+# shell command there runs under cmd.exe unless SPINEL_SHELL names a POSIX sh
+# (docs/windows.md). Name the one on PATH -- MSYS2's or Git for Windows' --
+# rather than fail on the first `mkdir -p`.
+if RUBY_PLATFORM.include?("mingw") && ENV["SPINEL_SHELL"].to_s == ""
+  found = ""
+  ENV["PATH"].to_s.split(";").each do |dir|
+    next if dir == "" || found != ""
+    d = dir.tr("\\", "/")
+    cand = File.join(d, "sh.exe")
+    found = cand if File.file?(cand)
+    # RubyInstaller's Devkit is on PATH only under `ridk enable`; its MSYS2
+    # sits beside the ruby that is
+    if found == "" && File.file?(File.join(d, "ruby.exe"))
+      cand = File.join(File.dirname(d), "msys64/usr/bin/sh.exe")
+      found = cand if File.file?(cand)
+    end
+  end
+  found = "C:/msys64/usr/bin/sh.exe" if found == "" && File.file?("C:/msys64/usr/bin/sh.exe")
+  if found == ""
+    $stderr.puts "spin: on Windows spin runs its build steps under a POSIX sh, and none was found:"
+    $stderr.puts "spin: install RubyInstaller's Devkit (or MSYS2), or set SPINEL_SHELL to a sh.exe"
+    exit(1)
+  end
+  ENV["SPINEL_SHELL"] = found
+end
+
 # --verbose belongs to spin and only to spin: strip it from the part of
 # ARGV before the `--` separator, leaving any --verbose after `--` in
 # `rest` so it reaches the program (e.g. `spin run app -- --verbose`
