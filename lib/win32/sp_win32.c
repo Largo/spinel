@@ -2150,8 +2150,10 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
 /* the calling thread's alternate signal stack, which a fault with
    SA_ONSTACK is delivered on (sp_w32_fault_signal) */
 static __thread stack_t sp_w32_altstack = { NULL, SS_DISABLE, 0 };
+static void sp_w32_stack_guarantee(void);
 int sigaltstack(const stack_t *ss, stack_t *old) {
   if (old) *old = sp_w32_altstack;
+  if (ss) sp_w32_stack_guarantee();   /* per thread, as the alternate stack is */
   if (ss) {
     if (!(ss->ss_flags & SS_DISABLE) && ss->ss_size < MINSIGSTKSZ) { errno = ENOMEM; return -1; }
     sp_w32_altstack = *ss;
@@ -2398,21 +2400,31 @@ static int sp_w32_handler_set(int sig) {
   return a->sa_handler && a->sa_handler != SIG_DFL && a->sa_handler != SIG_IGN;
 }
 
+/* After an overflow, put the stack back the way a fresh one is laid out --
+   the pages below the faulting one given back, one guard page under it, the
+   TEB's limit there -- so the memory manager grows it again and raises the
+   next overflow exactly as it raised this one. Everything below the fault
+   is dead: the handler leaves by a jump to a frame far above it. Called on
+   the alternate stack, before the handler runs. */
 static void sp_w32_rearm_guard(char *sp) {
   MEMORY_BASIC_INFORMATION mbi;
   if (!VirtualQuery(sp, &mbi, sizeof mbi)) return;
-  /* the lowest committed page of the stack the overflow ran down */
-  char *p = (char *)mbi.AllocationBase;
-  for (int guard = 0; guard < 4096 && p < sp; guard++) {
-    if (!VirtualQuery(p, &mbi, sizeof mbi)) return;
-    if (mbi.State == MEM_COMMIT) {
-      SYSTEM_INFO si; GetSystemInfo(&si);
-      DWORD old;
-      VirtualProtect(mbi.BaseAddress, si.dwPageSize, PAGE_READWRITE | PAGE_GUARD, &old);
-      return;
-    }
-    p = (char *)mbi.BaseAddress + mbi.RegionSize;
-  }
+  SYSTEM_INFO si; GetSystemInfo(&si);
+  uintptr_t pg = si.dwPageSize;
+  char *bottom = (char *)mbi.AllocationBase;
+  char *fault = (char *)((uintptr_t)sp & ~(pg - 1));
+  if (fault - bottom < (ptrdiff_t)(2 * pg)) return;
+  VirtualFree(bottom, (size_t)(fault - pg - bottom), MEM_DECOMMIT);
+  if (!VirtualAlloc(fault - pg, pg, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD)) return;
+  NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+  tib->StackLimit = fault;
+}
+
+/* the room a stack overflow is raised with on this thread, for the
+   exception's own dispatch and the move to the alternate stack */
+static void sp_w32_stack_guarantee(void) {
+  ULONG g = 64 * 1024;
+  SetThreadStackGuarantee(&g);
 }
 
 static void sp_w32_fault_run(sp_w32_fault *f) {
