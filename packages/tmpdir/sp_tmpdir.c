@@ -171,7 +171,7 @@ static int tmpdir_usable(const char *p) {
 static const char *tmpdir_expand(const char *p) {
   char raw[PATH_MAX];
   size_t n = 0;
-  if (p[0] != '/') {
+  if (!sp_path_root_len(p)) {
     if (!getcwd(raw, sizeof(raw)))
       sp_raise_cls("ArgumentError", "cannot expand a relative TMPDIR: getcwd failed");
     n = strlen(raw);
@@ -188,8 +188,10 @@ static const char *tmpdir_expand(const char *p) {
      output always starts at the root, so a ".." there is dropped rather
      than climbing above it -- "/.." is "/", as it is on the filesystem. */
   char out[PATH_MAX];
-  size_t len = 0;
-  for (size_t i = 0; i < n; ) {
+  size_t len = 0, floor = 0, i0 = 0;
+  /* a drive's root ("C:/", Windows) is kept as the floor ".." stops at */
+  if (sp_path_root_len(raw) == 3) { out[0] = raw[0]; out[1] = ':'; len = floor = 2; i0 = 2; }
+  for (size_t i = i0; i < n; ) {
     while (i < n && raw[i] == '/') i++;
     size_t b = i;
     while (i < n && raw[i] != '/') i++;
@@ -197,15 +199,15 @@ static const char *tmpdir_expand(const char *p) {
     if (clen == 0) continue;
     if (clen == 1 && raw[b] == '.') continue;
     if (clen == 2 && raw[b] == '.' && raw[b + 1] == '.') {
-      while (len > 0 && out[len - 1] != '/') len--;
-      if (len > 0) len--;   /* drop the separator too */
+      while (len > floor && out[len - 1] != '/') len--;
+      if (len > floor) len--;   /* drop the separator too */
       continue;
     }
     out[len++] = '/';
     memcpy(out + len, raw + b, clen);
     len += clen;
   }
-  if (len == 0) out[len++] = '/';   /* every component cancelled: the root */
+  if (len == floor) out[len++] = '/';   /* every component cancelled: the root */
 
   char *r = sp_str_alloc_raw(len + 1);
   memcpy(r, out, len);

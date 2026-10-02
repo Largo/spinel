@@ -94,7 +94,7 @@ class Pathname
     # one path and a fresh object on another has no single type here, and the
     # boxed result made the NEXT `/` in a chain compile as numeric division.
     o = "#{other}"
-    return Pathname.new(o) if o.start_with?(SEPARATOR)
+    return Pathname.new(o) if Pathname.root_str(o) != ""
     return Pathname.new(o) if @path == ""
     return self if o == "" || o == "."
 
@@ -133,7 +133,7 @@ class Pathname
   end
 
   def absolute?
-    @path.start_with?(SEPARATOR)
+    Pathname.root_str(@path) != ""
   end
 
   def relative?
@@ -178,11 +178,12 @@ class Pathname
   # Root first, receiver last.
   def descend
     out = []
-    parts = Pathname.split_str(@path)
-    acc = absolute? ? SEPARATOR : ""
-    out.push(Pathname.new(SEPARATOR)) if absolute?
+    root = Pathname.root_str(@path)
+    parts = Pathname.split_str(@path[root.length..])
+    acc = root
+    out.push(Pathname.new(root)) if root != ""
     parts.each do |part|
-      acc = acc == "" ? part : (acc == SEPARATOR ? "#{SEPARATOR}#{part}" : "#{acc}#{SEPARATOR}#{part}")
+      acc = acc == "" ? part : (acc.end_with?(SEPARATOR) ? "#{acc}#{part}" : "#{acc}#{SEPARATOR}#{part}")
       out.push(Pathname.new(acc))
     end
     out.each { |x| yield x } if block_given?
@@ -201,7 +202,7 @@ class Pathname
   # (one absolute, one relative).
   def relative_path_from(base)
     b = "#{base}"
-    raise ArgumentError, "different prefix" if absolute? != b.start_with?(SEPARATOR)
+    raise ArgumentError, "different prefix" if absolute? != (Pathname.root_str(b) != "")
 
     mine = Pathname.split_str(Pathname.clean_str(@path))
     theirs = Pathname.split_str(Pathname.clean_str(b))
@@ -458,6 +459,17 @@ class Pathname
 
   # ---- string helpers, shared by the pure-path methods ----
 
+  # A path's root: "/", a drive's "C:/" on a platform that has drives (it is
+  # the platform's File.absolute_path? that says so, so on POSIX a "C:/..."
+  # stays the relative path it is there), or "" for a relative path.
+  def self.root_str(path)
+    return SEPARATOR if path.start_with?(SEPARATOR)
+    if path.length >= 3 && path[1] == ":" && path[2] == SEPARATOR && File.absolute_path?(path[0, 3])
+      return path[0, 3]
+    end
+    ""
+  end
+
   # The name components of a path, with separators, "" and "." removed.
   # Does `self + o` keep o's trailing slash? CRuby keeps it when o still
   # names something after its leading "." and ".." are resolved against the
@@ -484,9 +496,10 @@ class Pathname
   # no anchor above it to cancel against) but is dropped at an absolute root,
   # where "/.." is "/".
   def self.clean_str(path)
-    abs = path.start_with?(SEPARATOR)
+    root = root_str(path)
+    abs = root != ""
     out = []
-    split_str(path).each do |part|
+    split_str(path[root.length..]).each do |part|
       if part == ".."
         if out.empty?
           out.push(part) unless abs
@@ -500,7 +513,7 @@ class Pathname
       end
     end
     body = out.join(SEPARATOR)
-    return "#{SEPARATOR}#{body}" if abs
+    return "#{root}#{body}" if abs
 
     body == "" ? "." : body
   end
