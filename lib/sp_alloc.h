@@ -144,6 +144,31 @@ static inline sp_int sp_str_chilled_sym(const char *s) {
    GNU's `s ?: sp_str_empty` */
 static inline const char *sp_str_or_empty(const char *s) { return s ? s : sp_str_empty; }
 
+#if defined(_WIN32)
+/* The length of a path's root on Windows, 0 for a relative path: "/", a
+   drive's "C:/" (or "C:\\"), or a share's "//server/share" (or
+   "\\\\server\\share"), the roots CRuby there answers paths under. A share's
+   root takes no separator of its own: CRuby spells it "//server/share". The
+   lexical path helpers (File.expand_path, Dir.glob, File.absolute_path?,
+   File.dirname, the tmpdir package) keep a root as it is and work on what
+   follows; on POSIX they test for "/" as they always have. */
+static inline size_t sp_file_path_root_len(const char *p) {
+  if (!p) return 0;
+  if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':' && (p[2] == '/' || p[2] == '\\'))
+    return 3;
+  if ((p[0] == '/' || p[0] == '\\') && (p[1] == '/' || p[1] == '\\') && p[2] && p[2] != '/' && p[2] != '\\') {
+    size_t i = 2;
+    while (p[i] && p[i] != '/' && p[i] != '\\') i++;   /* the server */
+    if (p[i] && p[i + 1] && p[i + 1] != '/' && p[i + 1] != '\\') {
+      i++;
+      while (p[i] && p[i] != '/' && p[i] != '\\') i++;   /* the share */
+    }
+    return i;
+  }
+  return p[0] == '/' ? 1 : 0;
+}
+#endif
+
 /* UTF-8 char-length cache. Shared (extern) so sp_str_sweep flushes the same
    table the length helpers in spinel_rt.h populate: a per-TU split would leave
    the generated TU's cache pointing at strings the archive-side sweep already
