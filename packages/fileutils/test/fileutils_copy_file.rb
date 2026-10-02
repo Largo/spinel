@@ -1,3 +1,4 @@
+# spinel: posix -- permission bits
 require "fileutils"
 require "tmpdir"
 

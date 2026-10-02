@@ -1,3 +1,4 @@
+# spinel: posix -- opens a FIFO (File.mkfifo)
 # `File.open` on a FIFO waits in the kernel for the other end, with no
 # descriptor to wait on. A green thread is pinned to its OS worker, so that one
 # syscall stalled every green thread pinned there, including the one counting a

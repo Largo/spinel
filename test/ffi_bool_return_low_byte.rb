@@ -10,7 +10,7 @@
 module Poison
   ffi_source <<~'C'
     #include <stdbool.h>
-    #if defined(__x86_64__)
+    #if defined(__x86_64__) && defined(__ELF__)
     __asm__(
       ".text\n"
       ".globl sp_probe_poison_false\n"

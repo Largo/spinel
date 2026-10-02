@@ -1,3 +1,4 @@
+# spinel: posix -- lists /dev/fd
 # Process.spawn with a filename redirection. The file named by `in:` is
 # opened read-only, so the child reads it and its contents survive; `out:`
 # and `err:` are created and truncated as before. The descriptors a spawn

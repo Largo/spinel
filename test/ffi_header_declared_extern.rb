@@ -1,3 +1,4 @@
+# spinel: posix -- binds libc's fopen directly, which knows no /tmp
 # An ffi_func whose symbol a header also declares, with C types other than the
 # spec's: fopen's FILE * is :ptr's void *, strchr and getenv return char * where
 # :str is const char *, memcpy is a macro on some libcs. The extern is declared

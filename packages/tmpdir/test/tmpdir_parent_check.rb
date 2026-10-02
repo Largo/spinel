@@ -1,3 +1,4 @@
+# spinel: posix -- permission bits (world-writable, sticky)
 # Dir.mktmpdir's block form refuses to clean up through a parent that is
 # world-writable and not sticky, and only checks a parent it chose itself.
 #

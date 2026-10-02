@@ -1,3 +1,4 @@
+# spinel: posix -- Gem.win_platform? is true on Windows, as in CRuby there
 # A leading `::Gem` names the top-level Gem (library code writes it to skip
 # a local constant of the name), and RbConfig's ruby_version is the API
 # version, the patch level zeroed.

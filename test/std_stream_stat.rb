@@ -1,3 +1,4 @@
+# spinel: posix -- a file name starting with "<", which Windows does not allow
 # stat on a standard stream fstats its descriptor, as IO#stat does for a
 # handle with no path, where it stat'ed its "<STDOUT>" placeholder.
 s = $stdout.stat

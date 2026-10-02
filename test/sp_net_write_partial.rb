@@ -1,3 +1,4 @@
+# spinel: posix -- winsock accepts a whole non-blocking send while its buffer has room, so one drain does not free it
 # Non-blocking write: hand back what the socket took, leave the policy for the
 # rest to the caller. sp_net_write_str / _bytes keep writing until everything
 # is gone, so one peer that cannot keep up delays delivery to every other one,

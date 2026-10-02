@@ -1,3 +1,4 @@
+# spinel: posix -- opens /etc/hosts
 # A pointer-backed handle IS nil when it is NULL in this backend, which is what
 # `nil?` answers. `== nil` reached the "a value of another static kind is never
 # equal" arm and folded to false, so a slot holding nil answered false to

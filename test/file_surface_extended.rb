@@ -1,3 +1,4 @@
+# spinel: posix -- File.absolute_path of "/a/b" is "C:/a/b" on Windows, as in CRuby there
 File.write("/tmp/sp_f2", "hello world")
 p File.ftype("/tmp/sp_f2")
 Dir.mkdir("/tmp/sp_f2dir") unless Dir.exist?("/tmp/sp_f2dir")

@@ -1,3 +1,4 @@
+# spinel: posix -- spawns /etc/passwd for EACCES
 # A spawn that fails names what failed, and leaves its exit status in $?.
 #
 # The child reports its errno through the pipe, and now also whether it was

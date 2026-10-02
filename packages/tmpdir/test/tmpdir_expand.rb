@@ -1,3 +1,4 @@
+# spinel: posix -- expects Dir.tmpdir to start with "/"
 require "tmpdir"
 
 # CRuby hands back File.expand_path of the candidate, not $TMPDIR as it
