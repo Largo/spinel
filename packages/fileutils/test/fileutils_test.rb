@@ -1,3 +1,4 @@
+# spinel: posix -- permission bits
 # The bundled fileutils: what a program that requires it actually calls.
 # Every answer here is CRuby's, generated from it -- the point of the package
 # is that these calls mean the same thing under both.

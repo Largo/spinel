@@ -1,3 +1,4 @@
+# spinel: posix -- expects RbConfig host_os to be darwin or linux
 # Library code asks RubyGems and RbConfig platform questions without a
 # require; both answer.
 p Gem.win_platform?

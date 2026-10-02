@@ -1,3 +1,4 @@
+# spinel: posix -- File.expand_path against "/tmp" gains the drive on Windows, as in CRuby there
 # CRuby's implicit conversion protocol at the builtin slots that take a path,
 # a mode, an offset, or a write payload: a user object converts through
 # #to_path / #to_str / #to_int / #to_s where the slot asks for it, instead of

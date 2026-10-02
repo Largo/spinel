@@ -1,3 +1,4 @@
+# spinel: posix -- permission bits (mode 0600)
 require "tempfile"
 
 # The block form: the file is open for reading and writing, and it is

@@ -1,3 +1,4 @@
+# spinel: posix -- NTFS keeps file times in 100 ns units
 # File.utime / File.lutime took their times as a double, which drops a Time's
 # nanoseconds: near 2^31 seconds a double has about 100ns of resolution, so
 # the fraction was gone before utimes' microseconds could even carry it. The

@@ -1,3 +1,4 @@
+# spinel: posix -- File.mkfifo; Windows has no FIFOs
 p001 = "/tmp/sp_mkfifo_3118_#{Process.pid}"
 File.delete(p001) if File.exist?(p001)
 r = begin; File.mkfifo(p001); rescue => e; e.class; end

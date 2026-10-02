@@ -1,3 +1,4 @@
+# spinel: posix -- File.expand_path of "/a/b" is "C:/a/b" on Windows, as in CRuby there
 # File.expand_path: pure-string absolute-path expansion. Only absolute
 # bases/paths are exercised so the result is independent of cwd/HOME.
 puts File.expand_path("test", "/tmp")

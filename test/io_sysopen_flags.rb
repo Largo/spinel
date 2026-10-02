@@ -1,3 +1,4 @@
+# spinel: posix -- Linux's numeric O_* flags
 # IO.sysopen dropped its flags argument: every sysopen was O_RDONLY, so a
 # FIFO opened for writing hung waiting for a writer of its own, and a
 # write-mode open of a fresh file failed. The flags (and the optional perm)

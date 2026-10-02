@@ -1,3 +1,4 @@
+# spinel: posix -- permission bits (a 0500 directory)
 # The usability check runs on the EXPANDED path, the one Dir.tmpdir hands
 # back, not on $TMPDIR as the shell left it. The expansion is lexical, so a
 # `..` after a symlink names a different directory than the raw string: here
