@@ -614,7 +614,11 @@ const char*sp_str_repeat(const char*s,sp_int n){SP_GC_ROOT_STR(s);
   size_t total=(size_t)n*l;
   if(total>(size_t)(1u<<30)) sp_raise_cls("ArgumentError","string size too big");
   char*r=sp_str_alloc_raw(total+1);
-  for(sp_int i=0;i<n;i++)memcpy(r+(l*i),s,l);
+  /* by doubling: one copy of s, then what is written so far, again -- a
+     log2(n) count of copies, where a copy per repetition was n calls of an
+     l-byte memcpy ("pad" * 150_000 made 150,000 of them) */
+  memcpy(r,s,l);
+  for(size_t done=l;done<total;){size_t c=done<total-done?done:total-done;memcpy(r+done,r,c);done+=c;}
   r[total]=0;
   sp_str_set_len(r,total);
   return sp_str_bin_from(r,s);
