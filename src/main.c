@@ -52,8 +52,33 @@ extern const char *g_ext_target;
 extern const char *g_ext_feature;
 extern char *g_ext_header_text;
 extern char *g_ext_shim_text;
+/* A platform whose programs are built differently -- native Windows, over
+   the lib/win32 shim -- says how in a header of its own; the defaults are
+   POSIX's. SPINEL_PLATFORM_CFLAGS / _LIBS go on every program's command line,
+   "@LIB@" in them spelled as the runtime's lib directory. */
+#if defined(_WIN32)
+#include "sp_win32_driver.h"
+#endif
+#ifndef SPINEL_DEFAULT_CC
+#define SPINEL_DEFAULT_CC "cc"
+#endif
+#ifndef SPINEL_EXE_SUFFIX
+#define SPINEL_EXE_SUFFIX ""
+#endif
+#ifndef SPINEL_PLATFORM_CFLAGS
+#define SPINEL_PLATFORM_CFLAGS ""
+#endif
+#ifndef SPINEL_PLATFORM_LIBS
+#define SPINEL_PLATFORM_LIBS ""
+#endif
+#ifndef SPINEL_PLATFORM_INIT
+#define SPINEL_PLATFORM_INIT() ((void)0)
+#endif
+#ifndef SPINEL_PLATFORM_PATH
+#define SPINEL_PLATFORM_PATH(p) (p)
+#endif
 #define PATH_SEP '/'
-#define EXE_SUFFIX ""
+#define EXE_SUFFIX SPINEL_EXE_SUFFIX
 
 /* Defined in spinel_parse.c (compiled with -DSPINEL_PARSE_AS_LIB). */
 char *sp_parse_file_to_text(const char *source_file, const char *argv0);
@@ -110,6 +135,28 @@ static void bi_put_toks(Str *bi, const char *kind, const char *toks) {
   char *d = strdup(toks);
   if (!d) return;
   for (char *t = strtok(d, " \t"); t; t = strtok(NULL, " \t")) bi_put(bi, kind, t);
+  free(d);
+}
+
+/* The platform's own flags (SPINEL_PLATFORM_CFLAGS / _LIBS) onto the command
+   line, "@LIB@" spelled as the runtime's lib directory (quoted: it may hold a
+   space), and into the --print-build report by kind. */
+static void add_platform_flags(Str *cmd, Str *bi, const char *flags, const char *lib_dir) {
+  if (!flags || !*flags) return;
+  char *d = strdup(flags);
+  if (!d) return;
+  for (char *t = strtok(d, " "); t; t = strtok(NULL, " ")) {
+    char tok[4200];
+    const char *at = strstr(t, "@LIB@");
+    if (at) snprintf(tok, sizeof tok, "%.*s%s%s", (int)(at - t), t, lib_dir, at + 5);
+    else snprintf(tok, sizeof tok, "%s", t);
+    if ((tok[0] == '-' && (tok[1] == 'I' || tok[1] == 'L')) && at) {
+      char q[4300]; snprintf(q, sizeof q, "-%c\"%s\" ", tok[1], tok + 2); s_add(cmd, q);
+    } else { s_add(cmd, tok); s_add(cmd, " "); }
+    bi_put(bi, tok[1] == 'I' ? "include" : tok[1] == 'D' ? "define" :
+               (tok[1] == 'l' || tok[1] == 'L' || tok[1] == 'W' || !strcmp(tok, "-static")) ? "lib" : "cflag",
+           tok[1] == 'I' ? tok + 2 : tok);
+  }
   free(d);
 }
 
@@ -390,6 +437,7 @@ int main(int argc, char **argv) {
 #ifdef SP_WORK_COUNT
   atexit(work_report);
 #endif
+  SPINEL_PLATFORM_INIT();
   /* `spinel diff FILE.rb ...`: the companion tool beside the compiler runs
      it (tools/diff.rb, built to bin/spinel-diff); the arguments pass through
      untouched, its exit status is the answer. */
@@ -414,7 +462,7 @@ int main(int argc, char **argv) {
      (and without the allocator flag spin appends after them). */
   const char **link_extra = malloc(sizeof(const char *) * (size_t)(argc > 0 ? argc : 1));
   int n_link_extra = 0;
-  const char *cc_cmd = "cc";
+  const char *cc_cmd = SPINEL_DEFAULT_CC;
   const char *opt_level = "2";
   /* --target=wasm32-wasi: the program is a WebAssembly module for a WASI
      host (wasmtime, Node's WASI, a browser shim), built by the wasi-sdk's
@@ -623,6 +671,8 @@ int main(int argc, char **argv) {
   free(eval_src.p);
 
   if (!source) { usage(); return 1; }
+  source = SPINEL_PLATFORM_PATH(source);
+  if (output) output = SPINEL_PLATFORM_PATH(output);
   /* -O0 / -O1 (and --debug) build the TU unoptimised: the generated program
      asks for larger fiber stacks (#4496). -Os / -Og and anything else keep
      the -O2 assumption. */
@@ -1048,6 +1098,7 @@ int main(int argc, char **argv) {
     static const char *const wcfl[] = { "-mllvm", "-wasm-enable-sjlj", "-mllvm", "-wasm-use-legacy-eh=false", "-Wl,-z,stack-size=8388608" };
     for (size_t wi = 0; wi < sizeof wcfl / sizeof wcfl[0]; wi++) { s_add(&cmd, wcfl[wi]); s_add(&cmd, " "); bi_put(&bi, "cflag", wcfl[wi]); }
   }
+  if (!target_wasi) add_platform_flags(&cmd, &bi, SPINEL_PLATFORM_CFLAGS, lib_dir);
   /* Compile the generated TU with the same threading define as the mt runtime
      archive it links, so the per-worker SP_TLS globals (sp_gc_roots, ...) it
      references through the runtime headers get the matching thread-local
@@ -1177,6 +1228,7 @@ int main(int argc, char **argv) {
       bi_put(&bi, "lib", link_extra[li]);
     }
   if (uses_threads) { s_add(&cmd, "-lpthread "); bi_put(&bi, "lib", "-lpthread"); }
+  if (!target_wasi) add_platform_flags(&cmd, &bi, SPINEL_PLATFORM_LIBS, lib_dir);
   s_add(&cmd, ov_define); s_add(&cmd, " ");
   bi_put(&bi, "define", ov_define);
   if (want_g) s_add(&cmd, "-g ");
