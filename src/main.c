@@ -21,6 +21,7 @@
 #include "spinel_rev.h"
 #include "codegen.h"
 #include "analyze.h"
+#include "repr.h"
 #include "csplit.h"
 
 #include <stdio.h>
@@ -281,14 +282,6 @@ static int refuse_overwrite(const char *path) {
           "spinel:   emitting there would replace that file with a translation\n"
           "spinel:   unit and lose what is in it. Choose another -o path, or\n"
           "spinel:   pass --force if you mean to replace it.\n", path);
-  return 1;
-}
-
-static int write_text_file(const char *path, const char *text) {
-  FILE *f = fopen(path, "wb");
-  if (!f) { fprintf(stderr, "spinel: cannot write '%s'\n", path); return 0; }
-  fputs(text, f);
-  fclose(f);
   return 1;
 }
 
@@ -557,6 +550,11 @@ int main(int argc, char **argv) {
     else if (sp_streq(a, "-E"))            { run_mode = 1; i++; }
     else if (sp_streq(a, "--emit-rbs"))    { emit_rbs = 1; i++; }
     else if (sp_streq(a, "--emit-types"))  { emit_types = 1; i++; }
+    else if (sp_streq(a, "--plan-check"))  { g_plan_check = 1; i++; }
+    else if (sp_streq(a, "--repr-check"))  { g_repr_check = 1; i++; }
+    else if (sp_streq(a, "--check-traits")) { g_check_traits = 1; i++; }
+    else if (sp_streq(a, "--check-bop-arity")) return builtin_ops_arity_check() ? 1 : 0;
+    else if (sp_streq(a, "--dump-traits"))  { g_dump_traits = 1; i++; }
     else if (sp_streq(a, "--emit-symbol-map")) { emit_symbol_map = 1; i++; }
     else if (sp_streq(a, "--dump-ast"))    { dump_ast = 1; i++; }
     else if (sp_streq(a, "-h") || sp_streq(a, "--help")) { usage(); return 0; }
@@ -1242,6 +1240,21 @@ int main(int argc, char **argv) {
      exists in the build cache. A --link basename lib<name>.(a|so) counts as
      providing -l<name>, so one package source serves both worlds -- the
      Makefile's -L via ffi_cflags and spin's absolute --link paths. */
+  /* The OpenSSL library directory the build probed on a host whose
+     OpenSSL is keg-only (Homebrew): the package's -lssl/-lcrypto resolve
+     there, and an ELF binary finds it again at run time (#7191). */
+  if (ffi_links.p && SPINEL_OPENSSL_LIBDIR[0] &&
+      (strstr(ffi_links.p, "-lssl") || strstr(ffi_links.p, "-lcrypto"))) {
+    char ld[1100];
+    snprintf(ld, sizeof ld, "-L%s", SPINEL_OPENSSL_LIBDIR);
+    s_add_arg(&cmd, ld); s_add(&cmd, " "); bi_put(&bi, "lib", ld);
+#if !defined(__APPLE__)
+    if (!target_wasi) {
+      snprintf(ld, sizeof ld, "-Wl,-rpath,%s", SPINEL_OPENSSL_LIBDIR);
+      s_add_arg(&cmd, ld); s_add(&cmd, " "); bi_put(&bi, "lib", ld);
+    }
+#endif
+  }
   if (ffi_links.p) {
     char *ltoks = strdup(ffi_links.p);
     for (char *t = strtok(ltoks, " "); t; t = strtok(NULL, " ")) {

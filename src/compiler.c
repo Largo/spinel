@@ -92,6 +92,8 @@ Compiler *comp_new(const NodeTable *nt) {
   c->hash_want = calloc((size_t)n, sizeof(TyKind));
   c->arr_want = calloc((size_t)n, sizeof(TyKind));
   c->poly_builtin_ty = calloc((size_t)n, sizeof(TyKind));
+  c->bop_inf = calloc((size_t)n, sizeof *c->bop_inf);
+  c->ucall_inf = calloc((size_t)n, sizeof *c->ucall_inf);
   c->node_cap = n;
   comp_node_ord(c, 0, NULL);   /* number the parsed nodes before any rewrite */
   c->node_ord_parsed = nt->count;
@@ -226,6 +228,10 @@ void comp_grow_node_arrays(Compiler *c) {
   c->hash_want = realloc(c->hash_want, sizeof(TyKind) * (size_t)n);
   c->arr_want = realloc(c->arr_want, sizeof(TyKind) * (size_t)n);
   c->poly_builtin_ty = realloc(c->poly_builtin_ty, sizeof(TyKind) * (size_t)n);
+  c->bop_inf = realloc(c->bop_inf, sizeof *c->bop_inf * (size_t)n);
+  for (int i = c->node_cap; i < n; i++) c->bop_inf[i] = NULL;
+  c->ucall_inf = realloc(c->ucall_inf, sizeof *c->ucall_inf * (size_t)n);
+  memset(c->ucall_inf + c->node_cap, 0, sizeof *c->ucall_inf * (size_t)(n - c->node_cap));
   for (int i = c->node_cap; i < n; i++) { c->ntype[i] = TY_UNKNOWN; c->norigin[i] = -1; c->nilnarrow[i] = TY_UNKNOWN; c->nscope[i] = 0; c->node_cbody[i] = -1; c->empty_arr_recv[i] = 0; c->empty_hash_recv[i] = 0; c->empty_hash_arg[i] = 0; c->store_misfit_arg[i] = 0; c->ivar_widen_src[i] = 0; c->hash_want[i] = TY_UNKNOWN; c->arr_want[i] = TY_UNKNOWN; c->poly_builtin_ty[i] = TY_UNKNOWN; c->strbuf_box[i] = 0; c->strbuf_handle_demand[i] = 0; c->strbuf_read_raw[i] = 0; c->poly_strbuf_lift[i] = 0; }
   c->node_cap = n;
 }
@@ -297,6 +303,8 @@ void comp_free(Compiler *c) {
   free(c->hash_want);
   free(c->arr_want);
   free(c->poly_builtin_ty);
+  free(c->bop_inf);
+  free(c->ucall_inf);
   free(c);
 }
 
@@ -832,6 +840,33 @@ int comp_builtin_kind_reopen_mi(Compiler *c, TyKind t, const char *name) {
   return mi >= 0 && dc == ci && c->scopes[mi].name && sp_streq(c->scopes[mi].name, name) ? mi : -1;
 }
 
+/* Whether any builtin kind's own class is reopened with a method of `name`
+   (comp_builtin_kind_reopen_mi for some kind). A yield site typed per site
+   needs every site's answer once one of them is a reopen's, which the
+   per-site table (ty_recv_builtin_result) does not carry for most names. */
+int comp_builtin_name_reopened(Compiler *c, const char *name) {
+  static const TyKind kinds[] = { TY_INT, TY_FLOAT, TY_STRING, TY_SYMBOL, TY_INT_ARRAY, TY_STR_INT_HASH };
+  if (!name) return 0;
+  for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++)
+    if (comp_builtin_kind_reopen_mi(c, kinds[k], name) >= 0) return 1;
+  return 0;
+}
+
+/* Whether a call on the chain from a yield up to `call` (`yield.size + 1`)
+   names a method some builtin class reopens, an alias that captured the
+   builtin (builtin_only) aside: the chain's sites are then typed one by
+   one. */
+int comp_yield_chain_reopened(Compiler *c, int call) {
+  const NodeTable *nt = c->nt;
+  for (int n = call, depth = 0; n >= 0 && depth < 16; depth++) {
+    if (nt_kind(nt, n) == NK_YieldNode) return 0;
+    if (nt_kind(nt, n) != NK_CallNode) return 0;
+    if (!nt_int(nt, n, "builtin_only", 0) && comp_builtin_name_reopened(c, nt_str(nt, n, "name"))) return 1;
+    n = nt_ref(nt, n, "receiver");
+  }
+  return 0;
+}
+
 static void vis_table_set(char ***names, int **kinds, int *n, int *cap, const char *name, int kind) {
   if (!name) return;
   for (int i = 0; i < *n; i++)
@@ -856,12 +891,22 @@ void comp_cmethod_vis_set(ClassInfo *ci, const char *name, int kind) {
   vis_table_set(&ci->cm_vis_names, &ci->cm_vis_kinds, &ci->ncm_vis, &ci->ccm_vis, name, kind);
 }
 
+void comp_cmethod_extend_vis_set(ClassInfo *ci, const char *name, int kind) {
+  vis_table_set(&ci->xcm_vis_names, &ci->xcm_vis_kinds, &ci->nxcm_vis, &ci->cxcm_vis, name, kind);
+}
+
+/* On each class, the class body's entry comes before an extend copy's. The
+   walk stops at the nearest class that defines the method: a parent's entry
+   does not reach past a subclass's own `def self.name`. */
 int comp_cmethod_vis_declared(Compiler *c, int class_id, const char *name, int *at) {
   if (!name) return SP_VIS_PUBLIC;
   for (int cid = class_id; cid >= 0; cid = c->classes[cid].parent) {
     ClassInfo *ci = &c->classes[cid];
     for (int i = 0; i < ci->ncm_vis; i++)
       if (sp_streq(ci->cm_vis_names[i], name)) { if (at) *at = cid; return ci->cm_vis_kinds[i]; }
+    for (int i = 0; i < ci->nxcm_vis; i++)
+      if (sp_streq(ci->xcm_vis_names[i], name)) { if (at) *at = cid; return ci->xcm_vis_kinds[i]; }
+    if (comp_cmethod_in_class(c, cid, name) >= 0) break;
   }
   return SP_VIS_PUBLIC;
 }
@@ -1234,12 +1279,13 @@ int comp_is_nested_int_array_literal(Compiler *c, int node) {
   return 1;
 }
 
-static int name_in(char **list, int n, const char *name) {
+int name_list_has(char **list, int n, const char *name) {
+  if (!name) return 0;
   for (int i = 0; i < n; i++) if (sp_streq(list[i], name)) return 1;
   return 0;
 }
 static void name_add(char ***list, int *n, int *cap, const char *name) {
-  if (name_in(*list, *n, name)) return;
+  if (name_list_has(*list, *n, name)) return;
   if (*n >= *cap) {
     *cap = *cap ? *cap * 2 : 4;
     *list = realloc(*list, sizeof(char *) * (size_t)*cap);
@@ -1254,8 +1300,8 @@ void comp_add_reader(ClassInfo *ci, const char *name) {
 void comp_add_writer(ClassInfo *ci, const char *name) {
   name_add(&ci->writers, &ci->nwriters, &ci->cwriters, name);
 }
-int comp_is_reader(ClassInfo *ci, const char *name) { return name_in(ci->readers, ci->nreaders, name); }
-int comp_is_writer(ClassInfo *ci, const char *name) { return name_in(ci->writers, ci->nwriters, name); }
+int comp_is_reader(ClassInfo *ci, const char *name) { return name_list_has(ci->readers, ci->nreaders, name); }
+int comp_is_writer(ClassInfo *ci, const char *name) { return name_list_has(ci->writers, ci->nwriters, name); }
 
 /* A plain setter name: `x=`, but not the operators that also end in `=`
    (`==`, `!=`, `<=`, `>=`, `===`) and not `[]=`, whose value form is its own. */
@@ -1308,7 +1354,7 @@ void comp_add_undef(ClassInfo *ci, const char *name) {
 }
 int comp_is_undeffed_in_chain(Compiler *c, int class_id, const char *name) {
   for (int cid = class_id; cid >= 0; cid = c->classes[cid].parent) {
-    if (name_in(c->classes[cid].undefs, c->classes[cid].nundefs, name)) return 1;
+    if (name_list_has(c->classes[cid].undefs, c->classes[cid].nundefs, name)) return 1;
     if (comp_method_in_class(c, cid, name) >= 0) return 0;
   }
   return 0;
@@ -1322,18 +1368,18 @@ void comp_add_sg_writer(ClassInfo *ci, const char *name) {
 void comp_add_sg_civ(ClassInfo *ci, const char *name) {
   if (name) name_add(&ci->sg_civ, &ci->nsg_civ, &ci->csg_civ, name);
 }
-int comp_is_sg_civ(ClassInfo *ci, const char *name) { return name_in(ci->sg_civ, ci->nsg_civ, name); }
-int comp_is_sg_inh(ClassInfo *ci, const char *name) { return name_in(ci->sg_inh, ci->nsg_inh, name); }
+int comp_is_sg_civ(ClassInfo *ci, const char *name) { return name_list_has(ci->sg_civ, ci->nsg_civ, name); }
+int comp_is_sg_inh(ClassInfo *ci, const char *name) { return name_list_has(ci->sg_inh, ci->nsg_inh, name); }
 void comp_add_sg_inh(ClassInfo *ci, const char *name) {
-  if (name_in(ci->sg_inh, ci->nsg_inh, name)) return;
+  if (name_list_has(ci->sg_inh, ci->nsg_inh, name)) return;
   if (ci->nsg_inh >= ci->csg_inh) {
     ci->csg_inh = ci->csg_inh ? ci->csg_inh * 2 : 4;
     ci->sg_inh = realloc(ci->sg_inh, sizeof(char *) * (size_t)ci->csg_inh);
   }
   ci->sg_inh[ci->nsg_inh++] = strdup(name);
 }
-int comp_is_sg_reader(ClassInfo *ci, const char *name) { return name_in(ci->sg_readers, ci->nsg_readers, name); }
-int comp_is_sg_writer(ClassInfo *ci, const char *name) { return name_in(ci->sg_writers, ci->nsg_writers, name); }
+int comp_is_sg_reader(ClassInfo *ci, const char *name) { return name_list_has(ci->sg_readers, ci->nsg_readers, name); }
+int comp_is_sg_writer(ClassInfo *ci, const char *name) { return name_list_has(ci->sg_writers, ci->nsg_writers, name); }
 
 void comp_add_alias_from(ClassInfo *ci, const char *new_name, const char *old_name, int alias_node) {
   comp_table_gen++;
@@ -2115,6 +2161,7 @@ LocalVar *scope_local_intern(Scope *s, const char *name) {
   lv->boxed_store_val = TY_UNKNOWN;
   lv->store_key_src = 0;
   lv->store_val_src = 0;
+  lv->store_elems_src = 0;
   lv->store_rest_src = 0;
   return lv;
 }
@@ -2253,7 +2300,10 @@ int container_elem_read_p(const NodeTable *nt, int id) {
   const char *nm = nt_str(nt, id, "name");
   if (!nm) return 0;
   if (sp_streq(nm, "[]") || sp_streq(nm, "fetch") || sp_streq(nm, "dig")) return 1;
-  if (sp_streq(nm, "first") || sp_streq(nm, "last")) {
+  /* sample and min / max answer one of the elements too, in their
+     zero-argument form (with a count they answer a new Array) */
+  if (sp_streq(nm, "first") || sp_streq(nm, "last") || sp_streq(nm, "sample") ||
+      sp_streq(nm, "min") || sp_streq(nm, "max")) {
     int a = nt_ref(nt, id, "arguments");
     int n = 0;
     if (a >= 0) nt_arr(nt, a, "arguments", &n);
@@ -2310,33 +2360,11 @@ const char *poly_enum_op_for(const char *name) {
    the user method's return -- typing it as the user's made the builtin arm's
    boxed answer read as that object, and the program segfaulted (#4012). */
 int poly_numeric_read_p(const char *name) {
-  static const char *const N[] = {
-    "abs", "round", "succ", "next", "pred", "ceil", "floor", "truncate",
-    "numerator", "denominator", "nonzero?", NULL };
-  if (!name) return 0;
-  for (int i = 0; N[i]; i++) if (sp_streq(name, N[i])) return 1;
-  return 0;
+  return bop_name_has_reader(name, BOP_READ_NUMERIC);
 }
 
 int poly_container_read_p(const char *name) {
-  static const char *const N[] = {
-    "first", "last", "keys", "values", "min", "max", "sum", "sort",
-    "reverse", "index",
-    /* the surface serves these now: each ends the dispatch in a runtime
-       helper that lets the receiver answer for itself, so the call's type is
-       the union rather than whichever user method owns the name */
-    "delete", "dig", "values_at",
-    /* a blockless each answers an Enumerator over the container; a class
-       with a Ruby each in the program left an Array on the raise default */
-    "each",
-    /* an Array's pop and shift answer through sp_poly_pop / sp_poly_shift,
-       which mutate the container behind the boxed pointer in place: a user
-       class owning the name left the call typed from that method alone, and
-       a genuine Array's answer was dropped or raised (#5099) */
-    "pop", "shift", NULL };
-  if (!name) return 0;
-  for (int i = 0; N[i]; i++) if (sp_streq(name, N[i])) return 1;
-  return 0;
+  return bop_name_has_reader(name, BOP_READ_CONTAINER);
 }
 
 /* The read-only String surface a poly receiver can be served from. Same idea
@@ -2357,19 +2385,7 @@ int poly_container_read_p(const char *name) {
    arm by NAME, so for those it would emit the container's helper inside a
    String-tagged arm. They keep whatever the container arms already give them. */
 int poly_string_read_p(const char *name) {
-  static const char *const N[] = {
-    "ascii_only?", "b", "byteindex", "byterindex", "byteslice", "bytesize",
-    "casecmp", "casecmp?", "center", "codepoints", "crypt",
-    "delete_prefix", "delete_suffix", "dump", "encode", "encoding",
-    "end_with?", "getbyte", "gsub", "hex", "intern",
-    "lines", "ljust", "lstrip", "match", "match?", "oct",
-    "partition", "rjust", "rpartition", "rstrip", "scan", "scrub",
-    "squeeze", "start_with?", "sub", "to_str", "to_sym",
-    "tr", "tr_s", "undump", "unicode_normalize", "unpack", "unpack1",
-    "valid_encoding?", NULL };
-  if (!name) return 0;
-  for (int i = 0; N[i]; i++) if (sp_streq(name, N[i])) return 1;
-  return 0;
+  return bop_name_has_reader(name, BOP_READ_STRING);
 }
 
 /* The class `self.class` at `recv` names when only one class can answer it:

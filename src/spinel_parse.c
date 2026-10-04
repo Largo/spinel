@@ -267,6 +267,8 @@ static char *cstr(pm_constant_id_t id) {
   return buf;
 }
 
+static void sp_find_builtin_ranges(const char *src);
+static int sp_in_builtin(const uint8_t *at);
 #include "sp_macro.c"
 
 /* ---- String escaping ---- */
@@ -430,7 +432,7 @@ else {
   }
 
   if (integer->negative) {
-    if (overflow || val >= max_negative) return -(long long)max_negative;
+    if (overflow || val >= max_negative) return -(long long)max_positive - 1;
     return -(long long)val;
   }
   if (overflow || val > max_positive) return (long long)max_positive;
@@ -614,7 +616,17 @@ static int flatten_node(pm_node_t *node) {
     pm_class_node_t *n = (pm_class_node_t *)node;
     N("ClassNode");
     R("constant_path", n->constant_path);
-    R("superclass", n->superclass);
+    /* `class A < (Base)`: parentheses around a single expression carry no
+       meaning, but every pass reads the superclass by its node kind, and a
+       ParenthesesNode read as no superclass at all (Object). */
+    pm_node_t *sup = n->superclass;
+    while (sup && PM_NODE_TYPE(sup) == PM_PARENTHESES_NODE) {
+      pm_node_t *pb = ((pm_parentheses_node_t *)sup)->body;
+      if (!pb || PM_NODE_TYPE(pb) != PM_STATEMENTS_NODE ||
+          ((pm_statements_node_t *)pb)->body.size != 1) break;
+      sup = ((pm_statements_node_t *)pb)->body.nodes[0];
+    }
+    R("superclass", sup);
     R("body", n->body);
     break;
   }
@@ -2249,6 +2261,24 @@ static void sp_includes_free(void) {
    Read off the splice markers, which every build keeps, not off the line
    map, which only a build with line maps has. */
 static size_t *sp_bi_lo = NULL, *sp_bi_hi = NULL;
+/* The files the require resolver took from the compiler's own builtins/
+   directory: a splice is a builtin's by where it came from, not by a
+   "/builtins/" somewhere in its path -- a program's own lib/builtins/x.rb
+   is the program's. */
+static char **sp_bi_paths = NULL;
+static int sp_bi_npaths = 0;
+static void sp_note_builtin_path(const char *path) {
+  for (int i = 0; i < sp_bi_npaths; i++) if (!strcmp(sp_bi_paths[i], path)) return;
+  char **np = realloc(sp_bi_paths, sizeof(char *) * (size_t)(sp_bi_npaths + 1));
+  if (!np) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+  sp_bi_paths = np;
+  sp_bi_paths[sp_bi_npaths++] = strdup(path);
+}
+static int sp_is_builtin_path(const char *p, size_t n) {
+  for (int i = 0; i < sp_bi_npaths; i++)
+    if (strlen(sp_bi_paths[i]) == n && !strncmp(sp_bi_paths[i], p, n)) return 1;
+  return 0;
+}
 static int sp_bi_n = 0;
 static const char *sp_bi_base = NULL;
 static void sp_find_builtin_ranges(const char *src) {
@@ -2261,8 +2291,7 @@ static void sp_find_builtin_ranges(const char *src) {
     size_t pl = !strncmp(line, SP_PUSH_PREFIX, strlen(SP_PUSH_PREFIX)) ? strlen(SP_PUSH_PREFIX)
               : !strncmp(line, SP_INSERT_PREFIX, strlen(SP_INSERT_PREFIX)) ? strlen(SP_INSERT_PREFIX) : 0;
     if (pl && sp < 64) {
-      int bi = 0;
-      for (size_t k = pl; k + 10 <= len && !bi; k++) if (!strncmp(line + k, "/builtins/", 10)) bi = 1;
+      int bi = sp_is_builtin_path(line + pl, len - pl);
       stk_lo[sp] = (size_t)(line - src); stk_bi[sp] = bi; sp++;
     }
     else if (!strncmp(line, SP_POP_PREFIX, strlen(SP_POP_PREFIX)) && sp > 0) {
@@ -3439,6 +3468,86 @@ static void sp_builtin_names_from(const char *content) {
   sp_builtin_names_from_into(content, &sp_builtin_enum_names, &sp_builtin_enum_names_n);
 }
 
+/* ---- what prism's lexer says of the text the builtin splices ask about ----
+   The splices below are decided before the parse, from the resolved text,
+   and the text alone cannot say where code stops: a `#` starts a comment
+   only where the lexer is reading code. In a string literal, a heredoc
+   body, a regexp or a %-literal it is a character, and as `#{` it opens
+   code. Nor can it say whether a word is a token or part of a string. So
+   those two questions go to prism, once per text and only when a splice has
+   to ask: the comments it found, and whether `break` and `define_finalizer`
+   were lexed as the keyword and an identifier (inside an interpolation too).
+   A program that evaluates a string has code prism lexed as text (a
+   class_eval template), so there a word counts wherever it is spelled, as
+   it did before; so does one prism could not parse. */
+typedef struct {
+  const char *src;            /* the text this was read from, NULL for none */
+  size_t *com; int com_n;     /* each comment's start and end offset, in order */
+  int brk, fin, evals;
+} SpSrcLex;
+static SpSrcLex sp_src_lex;
+
+static int sp_src_tok_is(const pm_token_t *tok, const char *word) {
+  size_t wl = strlen(word);
+  return (size_t)(tok->end - tok->start) == wl && memcmp(tok->start, word, wl) == 0;
+}
+
+static void sp_src_lex_token(void *data, pm_parser_t *parser, pm_token_t *tok) {
+  SpSrcLex *lx = (SpSrcLex *)data;
+  (void)parser;
+  if (tok->type == PM_TOKEN_KEYWORD_BREAK) lx->brk = 1;
+  if (tok->type != PM_TOKEN_IDENTIFIER) return;
+  if (sp_src_tok_is(tok, "define_finalizer")) lx->fin = 1;
+  if (sp_src_tok_is(tok, "eval") || sp_src_tok_is(tok, "class_eval") ||
+      sp_src_tok_is(tok, "module_eval") || sp_src_tok_is(tok, "instance_eval")) lx->evals = 1;
+}
+
+/* The text is about to be freed or replaced: what was read from it goes. */
+static void sp_src_lex_drop(void) {
+  free(sp_src_lex.com);
+  memset(&sp_src_lex, 0, sizeof sp_src_lex);
+}
+
+static SpSrcLex *sp_src_lex_of(const char *source) {
+  SpSrcLex *lx = &sp_src_lex;
+  if (lx->src == source) return lx;
+  sp_src_lex_drop();
+  lx->src = source;
+  pm_parser_t parser;
+  pm_lex_callback_t cb = { lx, sp_src_lex_token };
+  pm_parser_init(&parser, (const uint8_t *)source, strlen(source), NULL);
+  parser.lex_callback = &cb;
+  pm_node_t *root = pm_parse(&parser);
+  int cap = 0;
+  for (pm_comment_t *c = (pm_comment_t *)parser.comment_list.head; c; c = (pm_comment_t *)c->node.next) {
+    if (lx->com_n + 2 > cap) {
+      cap = cap ? cap * 2 : 64;
+      lx->com = (size_t *)realloc(lx->com, sizeof(size_t) * (size_t)cap);
+      if (!lx->com) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+    }
+    lx->com[lx->com_n++] = (size_t)(c->location.start - (const uint8_t *)source);
+    lx->com[lx->com_n++] = (size_t)(c->location.end - (const uint8_t *)source);
+  }
+  if (parser.error_list.size > 0) lx->evals = 1;
+  pm_node_destroy(&parser, root);
+  pm_parser_free(&parser);
+  return lx;
+}
+
+/* Is the byte at `at` inside a comment of `source`? */
+static int sp_src_in_comment(const char *source, const char *at) {
+  SpSrcLex *lx = sp_src_lex_of(source);
+  size_t off = (size_t)(at - source);
+  int lo = 0, hi = lx->com_n / 2;
+  while (lo < hi) {
+    int mid = (lo + hi) / 2;
+    if (off < lx->com[mid * 2]) hi = mid;
+    else if (off >= lx->com[mid * 2 + 1]) lo = mid + 1;
+    else return 1;
+  }
+  return 0;
+}
+
 /* Does the source mention `name` as a method: `.name` or a bare `name`
    followed by `(`, ` {`, ` do` or an argument, outside a comment? A textual
    test, as the Set splice's is: a false positive costs the parse of a small
@@ -3454,11 +3563,13 @@ static int sp_source_mentions_method(const char *src, const char *name) {
     int word_start = !((bc >= 'a' && bc <= 'z') || (bc >= 'A' && bc <= 'Z') || (bc >= '0' && bc <= '9') || bc == '_' || bc == '@' || bc == '$' || bc == ':');
     p = after;
     if (!word_end || !word_start) continue;
-    /* not in a comment: no `#` between the line start and the name */
+    /* not in a comment: a `#` between the line start and the name is asked
+       of the lexer, since one in a string literal or opening `#{` hides
+       nothing (`puts "issue #12"; p a.partition { ... }`) */
     const char *ls = p - nl;
     while (ls > src && ls[-1] != '\n') ls--;
     int in_comment = 0;
-    for (const char *k = ls; k < p - nl; k++) if (*k == '#') { in_comment = 1; break; }
+    for (const char *k = ls; k < p - nl; k++) if (*k == '#') { in_comment = sp_src_in_comment(src, p - nl); break; }
     if (in_comment) continue;
     if (bc == '.') return 1;
     if (ac == '(' || ac == ' ' || ac == '\n') return 1;
@@ -3512,6 +3623,7 @@ static char *sp_prepend_require(char *source, const char *exe_path, const char *
   char *ns = (char *)malloc(sl + hl + 1);
   if (!ns) return source;
   memcpy(ns, head, hl); memcpy(ns + hl, source, sl + 1);
+  sp_src_lex_drop();
   free(source);
   ns = resolve_plain_requires(ns, exe_path, fsl, fsl_n);
   size_t pl = strlen(SP_PUSH_PREFIX), il = strlen(SP_INSERT_PREFIX), nl = strlen(ns);
@@ -3531,12 +3643,23 @@ static char *sp_splice_named_builtin(char *source, const char *exe_path, const c
 
 /* builtins/object_space.rb: the finalizer API. Only for a program that names
    it -- the rest of ObjectSpace stays the refusal it is
-   (docs/limitations.md). */
+   (docs/limitations.md). Names it in code, that is: the file holds procs in
+   a table and calls them, which the whole-program analysis answers for, so a
+   program that only prints the word was refused for what it never did. */
 static char *sp_splice_object_space(char *source, const char *exe_path,
                                     unsigned char **fsl, size_t *fsl_n) {
   if (!strstr(source, "define_finalizer")) return source;
+  { SpSrcLex *lx = sp_src_lex_of(source); if (!lx->fin && !lx->evals) return source; }
   if (sp_src_defines_module(source, "ObjectSpace")) return source;
   return sp_prepend_require(source, exe_path, "require \"builtins/object_space\"\n", fsl, fsl_n);
+}
+
+/* builtins/process_detach.rb: Process.detach, for a program that calls it
+   and does not open Process itself (#7203) */
+static char *sp_splice_process_detach(char *source, const char *exe_path,
+                                      unsigned char **fsl, size_t *fsl_n) {
+  if (!strstr(source, "Process.detach") || sp_src_defines_module(source, "Process")) return source;
+  return sp_prepend_require(source, exe_path, "require \"builtins/process_detach\"\n", fsl, fsl_n);
 }
 
 static char *sp_splice_builtins(char *source, const char *exe_path,
@@ -3567,7 +3690,21 @@ static char *sp_splice_builtins(char *source, const char *exe_path,
     sp_builtin_names_from(content); free(content);
     if (sp_builtin_enum_names_n == 0) return source;
   }
-  if (sp_src_opens(source, "module Enumerable")) return source;   /* the program reopens it itself: leave that alone for now */
+  /* A program that reopens Enumerable gets the builtins beside it, unless
+     it may define a builtin's name itself: its own then has to answer for
+     an Array or a Hash too, which the builtin would answer instead */
+  if (sp_src_opens(source, "module Enumerable"))
+    for (int i = 0; i < sp_builtin_enum_names_n; i++) {
+      const char *nm = sp_builtin_enum_names[i];
+      size_t nl = strlen(nm);
+      for (const char *p = strstr(source, "def "); p; p = strstr(p + 4, "def ")) {
+        const char *q = p + 4;
+        while (*q == ' ') q++;
+        if (strncmp(q, nm, nl) == 0 && !(isalnum((unsigned char)q[nl]) || q[nl] == '_' ||
+                                         q[nl] == '?' || q[nl] == '!' || q[nl] == '='))
+          return source;
+      }
+    }
   int any = 0;
   for (int i = 0; i < sp_builtin_enum_names_n && !any; i++)
     if (sp_source_mentions_method(source, sp_builtin_enum_names[i])) any = 1;
@@ -3598,6 +3735,8 @@ static char *sp_splice_builtin_enumerator(char *source, const char *exe_path,
   int any = 0;
   for (int i = 0; names[i] && !any; i++) if (sp_source_mentions_method(source, names[i])) any = 1;
   if (!any) return source;
+  /* the keyword, not the word in a string or a comment */
+  { SpSrcLex *lx = sp_src_lex_of(source); if (!lx->brk && !lx->evals) return source; }
   char lib_dir[1024], gp[1200];
   sp_lib_dir(exe_path, lib_dir, sizeof lib_dir);
   int base_len = (int)strlen(lib_dir);
@@ -3833,6 +3972,7 @@ else {
             snprintf(gp, sizeof(gp), "%.*s/../%s.rb", base_len, lib_dir, lib_name);
             content = read_file(gp);
           }
+          if (content) sp_note_builtin_path(gp);
         }
         if (!content) snprintf(gp, sizeof(gp), "%.*s/packages/%s/%s.rb", base_len, lib_dir, first, lib_name);
         if (!content) content = read_file(gp);
@@ -4359,6 +4499,20 @@ static char *rewrite_syntax_sugar(char *source) {
         while (back2 > 0 && (out[back2 - 1] == ' ' || out[back2 - 1] == '\t')) back2--;
         char pv = back2 > 0 ? out[back2 - 1] : '\n';
         valid = strchr("=,([{+-*/%|&<>?:;!^\n", pv) != NULL;
+        /* ...or a command argument: a name, a blank, then `%` directly
+           followed by its delimiter (`puts %(...)`), as CRuby's lexer reads
+           it after a method name. A local read as such (`x %(y)`) costs only
+           the rewrites inside the parentheses; the modulo reading of a real
+           literal let a `<<WORD` in its text open a heredoc that ran to the
+           end of the file (#7194). */
+        if (!valid && back2 < oi && back2 > 0) {
+          size_t ws = back2;
+          while (ws > 0 && ((out[ws - 1] >= 'a' && out[ws - 1] <= 'z') || (out[ws - 1] >= 'A' && out[ws - 1] <= 'Z') ||
+                            (out[ws - 1] >= '0' && out[ws - 1] <= '9') || out[ws - 1] == '_' ||
+                            ((out[ws - 1] == '?' || out[ws - 1] == '!') && ws == back2))) ws--;
+          char w0 = ws < back2 ? out[ws] : 0;
+          valid = (w0 >= 'a' && w0 <= 'z') || (w0 >= 'A' && w0 <= 'Z') || w0 == '_';
+        }
       }
       if (valid) {
         char close2 = d == '(' ? ')' : d == '[' ? ']' : d == '{' ? '}' : d == '<' ? '>' : d;
@@ -4817,6 +4971,7 @@ static int sp_parse_emit(const char *source_file, const char *argv0, SpStrBuf *o
   source = sp_splice_named_builtin(source, argv0, "Gem", "builtins/gem", &fsl, &fsl_n);
   source = sp_splice_named_builtin(source, argv0, "RbConfig", "builtins/rbconfig", &fsl, &fsl_n);
   source = sp_splice_object_space(source, argv0, &fsl, &fsl_n);
+  source = sp_splice_process_detach(source, argv0, &fsl, &fsl_n);
   /* CRuby provides Set (3.2+) and IO::Buffer without a require wherever
      they are used, in a required file as well (activesupport's
      notifications/fanout.rb; #6740 for IO::Buffer). Ask over the resolved
@@ -4834,6 +4989,7 @@ static int sp_parse_emit(const char *source_file, const char *argv0, SpStrBuf *o
   source = sp_splice_builtins(source, argv0, &fsl, &fsl_n);
   source = sp_splice_builtin_extras(source, argv0, &fsl, &fsl_n);
   source = sp_splice_builtin_enumerator(source, argv0, &fsl, &fsl_n);
+  sp_src_lex_drop();
 
   /* class-body macro calls (module_eval'd templates, computed
      attach_function / const_set names) expanded in place; line count kept */

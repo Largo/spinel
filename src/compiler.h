@@ -11,6 +11,8 @@
 
 #include "node_table.h"
 #include "types.h"
+#include "builtin_names.h"
+#include "builtin_ops.h"
 
 /* require-gate (defined in spinel_parse.c). sp_feature_enabled(name) is 1 when
    feature `name` may be provided: always when the gate is off (g_require_gate
@@ -76,6 +78,8 @@ typedef struct {
                        shared-object semantics. Implies is_cell (body reads and
                        writes go through *_cell_<name>), but the cell is the
                        caller's slot -- no heap cell is allocated on entry. */
+  int borrowed_volatile; /* codegen: this String slot, or a slot borrowed here,
+                           is live across setjmp; propagate through lending */
   int inline_alias; /* (params of a yielding method, codegen only) how many
                        inline expansions currently in progress bind this
                        parameter as an ALIAS of the caller's variable rather
@@ -101,6 +105,9 @@ typedef struct {
   int obj_nilable;  /* an object-typed parameter some call site passes nil:
                        a user method called on it has to raise NoMethodError
                        for nil rather than run with a NULL self (#5088) */
+  int obj_nil_written; /* codegen's memo for an object-typed local: 1 when a
+                       write in its scope stores nil, 2 when none does, 0 not
+                       yet asked (#7262) */
   int box_nullable; /* an int parameter bound from an ivar that can be read
                        before anything assigned it: only BOXING it has to
                        yield nil. Kept apart from nullable_int, which also
@@ -153,6 +160,11 @@ typedef struct {
                        the key (value). Boxed when the callers disagree, so
                        the binding checks each call's argument j against the
                        container instead. */
+  unsigned long long store_elems_src; /* (params, arrays) bit j set: a splice
+                       through this parameter stores the ELEMENTS of the
+                       method's own positional parameter j (`a[i, n] = src`),
+                       boxed when its callers disagree: the binding checks
+                       each call's argument j's elements the same way. */
   int store_rest_src; /* (params, containers) one past the first element of the
                        method's rest parameter that a push, unshift or insert
                        through this parameter stores, or 0: the rest
@@ -458,6 +470,11 @@ typedef struct {
   char **cm_vis_names;
   int  *cm_vis_kinds;
   int ncm_vis, ccm_vis;
+  /* The visibility an `extend` copy brings from its module. The class body's
+     own entry above wins over it, whichever comes first. */
+  char **xcm_vis_names;
+  int  *xcm_vis_kinds;
+  int nxcm_vis, cxcm_vis;
   /* class << self attr_accessor/reader/writer: singleton-level accessors
      stored in static globals (cst_<Class>_<field>), not in per-instance ivars */
   char **sg_readers;   /* singleton reader names */
@@ -645,6 +662,15 @@ static inline int native_takes(const NativeMethod *m, int argc) {
   return m->nargs == argc || (m->rest && argc > m->nargs);
 }
 
+/* A user-method call as inference bound it (--plan-check, #7100): the
+   method scope, the class whose chain the binding arm searched (-1 for a
+   top-level def), and which arm bound it. via 0 (UC_NONE): no binding. */
+enum { UC_NONE, UC_TOP, UC_INST, UC_CMETH, UC_SUPER, UC_SEND_BLIND, UC_IE,
+       UC_INCLUDED, UC_REOPEN,
+       UC_POLY };   /* a boxed receiver's dispatch: the first user candidate
+                       stands for the union the call was typed over */
+typedef struct { int mi; short owner_ci; unsigned char via; } UCallInf;
+
 typedef struct {
   const NodeTable *nt;
   TyKind *ntype;    /* [node_cap] node id -> inferred type */
@@ -706,6 +732,10 @@ typedef struct {
   TyKind *poly_builtin_ty; /* [node_cap] for a container read on a poly receiver a
                               user class also owns: the type the builtin surface
                               alone would give, so codegen can shape its arm (#3459) */
+  const struct BuiltinOp **bop_inf; /* [node_cap] the builtin-op row inference
+                                       answered the call with (--plan-check only) */
+  UCallInf *ucall_inf; /* [node_cap] the user method inference bound the call
+                          to (--plan-check only) */
   int *hash_default_arg_memo; /* [node_cap] hash_new_default_arg(node) memo; INT_MIN = uncomputed */
   unsigned hash_default_arg_memo_gen; /* scope-index generation the memo was built for */
   int hash_default_arg_memo_cap;      /* allocated length of hash_default_arg_memo */
@@ -847,10 +877,18 @@ typedef struct {
   int *bi_base_cnt;
   char **bi_base_key;
   int bi_base_cap;
+  /* (codegen, lazily) whether the program names a magnitude that can reach
+     2^62 (a literal, a `**` or `<<` count, a long digit string): 0 unknown,
+     1 no, 2 yes. -2^63, which an Integer slot that can hold nil reads as
+     nil, is reachable only from such a program in practice, so the check on
+     a store into one (int_slot_store_needs_ck) is emitted only for it. */
+  int big_int_src;
 } Compiler;
 
 Compiler *comp_new(const NodeTable *nt);
 void comp_free(Compiler *c);
+/* Is `name` one of the n strings in `list`? (0 for a NULL name) */
+int name_list_has(char **list, int n, const char *name);
 
 /* Resize per-node arrays (ntype/nscope) after the node table grew. */
 void comp_grow_node_arrays(Compiler *c);
@@ -898,6 +936,18 @@ int    comp_method_index(Compiler *c, const char *name); /* -1 if none */
    as the fallback. See analyze_util.c. */
 int    comp_self_call_mi(Compiler *c, int call_node, const char *name);
 int    comp_cbody_call_mi(Compiler *c, int call_node, const char *name);
+/* Does the receiver of a retargeted `recv.send(:name)` (send_blind) answer
+   name itself -- an instance's method or reader, a class constant's class
+   method -- rather than through a top-level def? srt is recv's type. */
+int    send_blind_recv_owns(Compiler *c, int recv, TyKind srt, const char *name);
+/* What a dispatch of `name` over cid's subtree answers: r (the base method
+   base_mi's answer) unified with the return of every other implementation a
+   class in the subtree runs -- its chain's, so a module a subclass includes
+   counts -- class methods when cmeth. A yielding one answers call_id's
+   block (method_call_ret) when call_id >= 0. Inference's object and
+   implicit-self calls and codegen's dispatch switch share it. */
+TyKind dispatch_ret_over(Compiler *c, int cid, const char *name, int cmeth, int base_mi, TyKind r,
+                         int call_id);
 /* 1 iff `node` is a constant path naming an `ffi_const` declaration, with its
    value in *out. Such a name is a VALUE, not a class, wherever the two are
    told apart. */
@@ -985,14 +1035,14 @@ int        dynamic_new_may_reach(Compiler *c, int call_id, int cid);  /* k.new c
 int        anon_struct_ci_for_value(Compiler *c, int val);  /* k = Struct.new(...) value node */
 const char *struct_call_dup_member(Compiler *c, int callnode);  /* first duplicate member sym name, or NULL */
 const char *sym_static_value(Compiler *c, int node);  /* SymbolNode or sole-symbol local */
-/* The String in-place mutators, as one table with a per-site mask (see
-   sp_str_mutator in analyze_util.c). The demand analysis and the codegen
+/* The String in-place mutators, as one table with a per-site mask in
+   builtin_ops.c. The demand analysis and the codegen
    re-routes used to keep four near-identical copies of this list; a mutator
    added to one and missed in another is exactly how #3307 / #3333 arrived. */
-#define SP_MUT_LOCAL     1u  /* seeds local-slot promotion: every mutator */
-#define SP_MUT_CONTAINER 2u  /* container-read mutation: no `[]=` */
-#define SP_MUT_IVAR      4u  /* ivar slot or a reader call (no rename) */
-#define SP_MUT_NARROW    8u  /* guard-narrowed poly re-route: also no append_as_bytes */
+#define SP_MUT_LOCAL     BOP_MUT_LOCAL      /* seeds local-slot promotion: every mutator */
+#define SP_MUT_CONTAINER BOP_MUT_CONTAINER  /* container-read mutation */
+#define SP_MUT_IVAR      BOP_MUT_IVAR       /* ivar slot or a reader call (no rename) */
+#define SP_MUT_NARROW    BOP_MUT_NARROW     /* guard-narrowed poly re-route: no append_as_bytes */
 /* 1 iff `nm` is a String in-place mutator serviceable at every site in `want`. */
 int sp_str_mutator(const char *nm, unsigned want);
 /* 1 iff call node `id` is a String method whose value is its receiver. */
@@ -1032,6 +1082,8 @@ int        comp_cvar_owner(const Compiler *c, int cid, const char *name); /* the
 /* 1 iff method m's param idx is a byref string out-param (LocalVar.byref_out):
    passed as const char** so callee mutation lands in the caller's variable. */
 int        comp_byref_param(Compiler *c, Scope *m, int idx);
+/* Propagate codegen's setjmp-slot qualifiers through borrowed String calls. */
+void       propagate_borrowed_volatile(Compiler *c);
 /* Find the instance-method scope index for class_id + method name, or -1. */
 int        comp_method_in_class(Compiler *c, int class_id, const char *name);
 /* The instance_exec emission runs a method's block as an instance method of
@@ -1073,10 +1125,14 @@ int        io_family_descends(Compiler *c, int k, int owner);
    *def_class (if non-NULL) is set to the class that defines the method. */
 int        comp_method_in_chain(Compiler *c, int class_id, const char *name, int *def_class);
 int        comp_builtin_kind_reopen_mi(Compiler *c, TyKind t, const char *name);
+int        comp_builtin_name_reopened(Compiler *c, const char *name);
+int        comp_yield_chain_reopened(Compiler *c, int call);
 /* Record method `name`'s visibility on a class (overwrite-or-append). */
 void       comp_method_vis_set(ClassInfo *ci, const char *name, int kind);
 /* Record class method `name`'s visibility on a class (overwrite-or-append). */
 void       comp_cmethod_vis_set(ClassInfo *ci, const char *name, int kind);
+/* The same for a class method an `extend` copies in; a later extend overwrites. */
+void       comp_cmethod_extend_vis_set(ClassInfo *ci, const char *name, int kind);
 /* Visibility of class method `name` up class_id's superclass chain; the
    declaring class goes to *at. SP_VIS_PUBLIC when none records it. */
 int        comp_cmethod_vis_declared(Compiler *c, int class_id, const char *name, int *at);
@@ -1185,6 +1241,10 @@ static inline TyKind comp_sn_retype(Compiler *c, int id, TyKind t) {
   return old;
 }
 
+/* repr.c: the representation decisions the inline readers below defer to */
+TyKind repr_stored_type(const Compiler *c, int id, TyKind t);
+int repr_value_obj(const Compiler *c, TyKind t);
+
 /* Node type cache. */
 static inline TyKind comp_ntype(const Compiler *c, int id) {
   if (id < 0 || id >= c->nt->count) return TY_UNKNOWN;
@@ -1198,21 +1258,15 @@ static inline TyKind comp_ntype(const Compiler *c, int id) {
      Exception: a read marked strbuf_box yields the live HANDLE, so the
      mutation is observable through the container it is stored in (#3227). */
   TyKind t = c->ntype[id];
-  if (t == TY_STRBUF) return c->strbuf_box[id] ? TY_STRBUF : TY_STRING;
-  /* A node under a handle demand STORES as the handle -- a temp spilled from
-     it has to be an sp_String *, not a const char * -- while still dispatching
-     as a String, which comp_recv_type answers for. That split is the whole
-     point of the second array (#4363). */
-  if (c->strbuf_handle_demand[id]) return TY_STRBUF;
+  /* the String-handle refinement is repr.c's (repr_stored_type) */
+  if (t == TY_STRBUF || c->strbuf_handle_demand[id]) return repr_stored_type(c, id, t);
   return t;
 }
 
 /* 1 iff t is a user-object type whose class is represented by value (sp_X,
    not a heap pointer). See detect_value_types / reference_legacy_value_type_logic. */
 static inline int comp_ty_value_obj(const Compiler *c, TyKind t) {
-  if (!ty_is_object(t)) return 0;
-  int cid = ty_object_class(t);
-  return cid >= 0 && cid < c->nclasses && c->classes[cid].is_value_type;
+  return repr_value_obj(c, t);   /* repr.c */
 }
 
 /* The sp_poly_enum_proc op for a block-carrying Enumerable name, or NULL.

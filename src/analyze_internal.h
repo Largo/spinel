@@ -85,11 +85,13 @@ const char *superclass_builtin_exc_name(const NodeTable *nt, int sc);   /* analy
 int is_syserr_family_name(const char *n);           /* analyze_util.c */
 int builtin_method_known(const char *cls, const char *m);
 int builtin_method_names(const char *cls, const char **out, int cap);
+int builtin_name_arity_span(const char *name, int with_block, int *lo, int *hi);
 int builtin_arity_violation(Compiler *c, int id);
 int is_handler_proc_block(Compiler *c, int id);
 int builtin_class_id(const char *name);
 int builtin_class_parent_id(int id);
 int desugar_builtin_reopen_named_superclass(Compiler *c);
+int desugar_builtin_reopen_self_class(Compiler *c);
 const char *class_ruby_name(Compiler *c, int ci); /* codegen.c */
 int builtin_object_method_known(const char *m);
 int core_method_name(const char *n);   /* analyze_desugar.c: a core class's public method */
@@ -171,6 +173,7 @@ int object_reopen_answers(Compiler *c, const char *cls, int call_id, TyKind *out
 /* 1 if `id` is any proc-creating literal: a proc/lambda/Proc.new call (above)
    or a `->(){}` LambdaNode. */
 int is_proc_create(Compiler *c, int id);
+int subtree_has_side_effect(Compiler *c, int id);   /* codegen_util.c */
 
 /* Shared cached local-write index (analyze_pass.c): bucket walk over
    (scope, name) for "every write of local X in scope S" queries, instead of
@@ -250,7 +253,6 @@ void register_include_attrs(Compiler *c);
 void rewrite_attr_supers(Compiler *c);
 void unmark_referenced_module_sources(Compiler *c);
 void register_extends(Compiler *c);
-int cmethod_has_bare_new(Compiler *c, int mi);
 int cmethod_needs_specialization(Compiler *c, int mi, int ci, int def_cls, int *has_new);
 int class_value_escapes(Compiler *c, int cid);
 void specialize_inherited_cls_new(Compiler *c);
@@ -270,6 +272,8 @@ void seed_unsupplied_nil_defaults(Compiler *c);
 int infer_container_flow(Compiler *c);
 int an_builtin_only_p(void);
 TyKind an_builtin_answer(Compiler *c, int id);
+int an_yield_site_builtin_answer(Compiler *c, int id, TyKind kind, TyKind *out);
+extern int g_scopes_settled;   /* analysis done (codegen_util.c) */
 int poly_expr_flows_container(Compiler *c, int node);
 int reconcile_locals_reading_ivars(Compiler *c);
 int widen_object_locals_from_poly_writes(Compiler *c);
@@ -299,6 +303,16 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out);
 int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out);
 int infer_array_call(Compiler *c, int id, TyKind rt, TyKind *out);
 int infer_hash_call(Compiler *c, int id, TyKind rt, TyKind *out);
+/* bop_find for the call `id`, recording the row under --plan-check */
+struct BuiltinOp;
+const struct BuiltinOp *an_bop_find(Compiler *c, int id, TyKind rt, const char *name,
+                                    int argc, int has_block);
+/* method_call_ret(c, mi, id) for a call an arm of infer_call bound to the
+   user method mi, recording the binding (via UC_*, the class owner_ci whose
+   chain was searched) under --plan-check */
+TyKind an_user_call(Compiler *c, int id, int mi, int via, int owner_ci);
+/* the record alone, for an arm that answers the bound call another way */
+void an_user_call_record(Compiler *c, int id, int mi, int via, int owner_ci);
 int infer_numeric_call(Compiler *c, int id, TyKind rt, TyKind *out);
 /* The array a map-shaped call answers from its block's tail (analyze_infer_recv.c). */
 TyKind infer_map_block_ty(Compiler *c, int id, int block);
@@ -375,6 +389,7 @@ int desugar_forwarding_to_rest_callee(Compiler *c);
 int desugar_anon_block_param(Compiler *c);
 int desugar_singleton_class_define_method(Compiler *c);
 int desugar_define_method_proc_arg(Compiler *c);
+int method_body_next_to_return(NodeTable *nt, int id);
 int desugar_define_method_captures(Compiler *c);
 int desugar_define_method_keywords(Compiler *c);
 void desugar_extended_module_attrs(Compiler *c);
@@ -387,6 +402,7 @@ int desugar_class_eval_value(Compiler *c);
 int desugar_instance_eval_builtin(Compiler *c);
 int desugar_builtin_class_var_recv(Compiler *c);
 int desugar_class_body_bare_new(Compiler *c);
+int desugar_bare_spawn(Compiler *c);
 int desugar_bare_class_self_calls(Compiler *c);
 int desugar_ie_bare_object_calls(Compiler *c);
 int desugar_bare_object_reopen_calls(Compiler *c);
@@ -417,13 +433,13 @@ int desugar_mutator_receiver_value(Compiler *c);
 int desugar_method_curry(Compiler *c);
 int desugar_curry_arity_to_int(Compiler *c);
 int desugar_int_enum_with_index(Compiler *c);
+int desugar_hash_iter_with_index(Compiler *c);
 int widen_shared_cmp_params(Compiler *c);
 int desugar_reduce_proc_arg(Compiler *c);
 int desugar_block_capture_wrap(Compiler *c);
 int desugar_user_not_match(Compiler *c);
 int desugar_env_enum(Compiler *c);
 int desugar_dir_surface(Compiler *c);
-const char *builtin_class_var_static_name(Compiler *c, int node);
 int local_write_binds_value(NodeKind k);
 int desugar_enumerable_chain(Compiler *c);
 int desugar_implicit_send(Compiler *c);
@@ -512,7 +528,6 @@ int blkp_binds_param(Compiler *c, int create, const char *name);
 void blkp_rewrite_refs(Compiler *c, int node, const char *oldn, const char *newn);
 void numbered_rename_locals_str(NodeTable *nt, int L, const char *from, const char *to);
 void blkp_mark_subtree(const NodeTable *nt, int node, char *marks);
-int blkp_needs_rename(Compiler *c, int L);
 void qc_collect_writes(Compiler *c, int node, char (*path)[64], int depth, QCWrite **ws, int *n, int *cap);
 int qc_read_chain(const NodeTable *nt, int node, char (*chain)[64], int *abs_anchor);
 void qc_qualified_name(char *out, size_t cap, const QCWrite *w);
@@ -546,9 +561,9 @@ extern const char *g_ext_entries;
 /* the class every value of a boxed-value hash slot holds, or -1 (#4846) */
 int hv_value_class(Compiler *c, int recv);
 int comp_class_is_module(Compiler *c, ClassInfo *ci);
+int poly_ivar_set_class(Compiler *c, int k);
 int is_builtin_reopen(const char *name);
 char **dsend_candidates(Compiler *c, int *out_n);
 int exc_reopen_definers(Compiler *c, const char *mname, int *out, int max);
 
 #endif
-

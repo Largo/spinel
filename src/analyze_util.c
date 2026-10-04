@@ -564,35 +564,6 @@ int class_recv_static_ci(Compiler *c, int node) {
   return class_var_static_ci(c, node);
 }
 
-/* A local variable that statically holds exactly one BUILTIN class constant
-   (every write in its scope assigns the same builtin class name): that name,
-   or NULL. The user-class analogue is class_var_static_ci; builtins have no
-   class index, so this resolves by name (#2715). */
-const char *builtin_class_var_static_name(Compiler *c, int node) {
-  const NodeTable *nt = c->nt;
-  if (node < 0 || nt_kind(nt, node) != NK_LocalVariableReadNode) return NULL;
-  const char *vn = nt_str(nt, node, "name");
-  if (!vn) return NULL;
-  Scope *sc = comp_scope_of(c, node);
-  const char *found = NULL;
-  for (int w = comp_lvw_first(c, vn); w >= 0; w = comp_lvw_next(c, w)) {
-    const char *wn = nt_str(nt, w, "name");
-    if (!wn || !sp_streq(wn, vn) || comp_scope_of(c, w) != sc) continue;
-    if (!local_write_binds_value(nt_kind(nt, w))) return NULL;
-    int val = nt_ref(nt, w, "value");
-    const char *cn = (val >= 0 && nt_kind(nt, val) == NK_ConstantReadNode)
-                     ? nt_str(nt, val, "name") : NULL;
-    /* a USER class constant qualifies too: the retargeted receiver then rides
-       every ConstantReadNode dispatch arm (method_defined?, subclasses,
-       class_eval, ...), not just the sites class_var_static_ci was wired into
-       (#2717, #2721) */
-    if (!cn || !(is_builtin_class_name(cn) || comp_class_index(c, cn) >= 0)) return NULL;
-    if (found && !sp_streq(found, cn)) return NULL;   /* two classes: dynamic */
-    found = cn;
-  }
-  return found;
-}
-
 /* The literal symbol behind a symbol-typed expression: a SymbolNode itself,
    or a local variable whose only write (in its scope, plain write) is one.
    Lets inject(:op)-style operator selection see through `s = :+; a.inject(s)`.
@@ -635,25 +606,7 @@ const char *sym_static_value(Compiler *c, int node) {
    its handle, through the shared-mutable shim's shadow (#4363), and a
    guard-narrowed box through its poly arm as the others do. */
 int sp_str_mutator(const char *nm, unsigned want) {
-  static const struct { const char *nm; unsigned mask; } M[] = {
-    { "[]=",             15u }, { "insert",         15u }, { "slice!",     15u },
-    { "setbyte",         15u },
-    { "append_as_bytes", SP_MUT_LOCAL | SP_MUT_CONTAINER | SP_MUT_IVAR },
-    { "<<",              15u }, { "concat",         15u }, { "prepend",    15u },
-    { "replace",         15u }, { "clear",          15u }, { "bytesplice", 15u },
-    { "gsub!",           15u }, { "sub!",           15u }, { "upcase!",    15u },
-    { "downcase!",       15u }, { "capitalize!",    15u }, { "swapcase!",  15u },
-    { "strip!",          15u }, { "lstrip!",        15u }, { "rstrip!",    15u },
-    { "chomp!",          15u }, { "chop!",          15u }, { "squeeze!",   15u },
-    { "tr!",             15u }, { "delete!",        15u }, { "tr_s!",      15u },
-    { "delete_prefix!",  15u }, { "delete_suffix!", 15u }, { "reverse!",   15u },
-    { "succ!",           15u }, { "next!",          15u }, { "scrub!",     15u },
-    { NULL, 0 }
-  };
-  if (!nm) return 0;
-  for (int i = 0; M[i].nm; i++)
-    if (sp_streq(nm, M[i].nm)) return (M[i].mask & want) == want;
-  return 0;
+  return bop_name_mutates(nm, want);
 }
 /* A String call whose value is its receiver, whatever it did to it first:
    to_s, to_str, itself and freeze, and the mutators that answer self --
@@ -1173,7 +1126,7 @@ int is_blk_param_call(Compiler *c, int node, int mi) {
   const NodeTable *nt = c->nt;
   if (node < 0 || !nt_type(nt, node) || !sp_streq(nt_type(nt, node), "CallNode")) return 0;
   const char *nm = nt_str(nt, node, "name");
-  if (!nm || (!sp_streq(nm, "call") && !sp_streq(nm, "()") && !sp_streq(nm, "[]"))) return 0;
+  if (!nm || !is_call_alias(nm)) return 0;
   int recv = nt_ref(nt, node, "receiver");
   if (recv < 0 || !nt_type(nt, recv) || !sp_streq(nt_type(nt, recv), "LocalVariableReadNode")) return 0;
   const char *rn = nt_str(nt, recv, "name");
@@ -1493,6 +1446,23 @@ TyKind block_next_value_ty(Compiler *c, int node) {
   return r;
 }
 
+/* The value a block forwarded out of method `emi` (`callee(&)`,
+   `callee(&b)`, `callee(...)`) answers inside it. The forwarding call is one
+   node in emi's body, shared by every site emi is spliced into, so the first
+   concrete site's block type is not enough: when emi's sites' blocks answer
+   different kinds (`machine(:x) { "s" }` and `machine(:y) { 42 }`), the value
+   is only known at run time, as for a `&block.call` (#3793). Typed from the
+   first site, the second site's Integer was stored into the first site's
+   `const char *` and the C did not build. */
+static TyKind yvt_forwarded_value(Compiler *c, int emi) {
+  TyKind first = yield_value_type(c, emi);
+  if (g_yvt_unify_all || first == TY_UNKNOWN || first == TY_VOID) return first;
+  g_yvt_unify_all = 1;
+  TyKind all = yield_value_type(c, emi);
+  g_yvt_unify_all = 0;
+  return all != first && all != TY_UNKNOWN ? TY_POLY : first;
+}
+
 TyKind yield_value_type(Compiler *c, int mi) {
   for (int i = 0; i < g_yvt_depth; i++)
     if (g_yvt_mi[i] == mi) return TY_UNKNOWN;
@@ -1546,7 +1516,7 @@ TyKind yield_value_type(Compiler *c, int mi) {
           else if (nt_kind(nt, bexpr) == NK_CallNode) {
             const char *pnm = nt_str(nt, bexpr, "name");
             int pblk = nt_ref(nt, bexpr, "block");
-            if (pnm && pblk >= 0 && (sp_streq(pnm, "proc") || sp_streq(pnm, "lambda")) &&
+            if (pnm && pblk >= 0 && (is_proc_constructor(pnm)) &&
                 nt_kind(nt, pblk) == NK_BlockNode)
               pbody = nt_ref(nt, pblk, "body");
           }
@@ -1561,7 +1531,7 @@ TyKind yield_value_type(Compiler *c, int mi) {
           continue;
         }
       }
-      TyKind ft = (emi >= 0 && emi != mi) ? yield_value_type(c, emi) : TY_UNKNOWN;
+      TyKind ft = (emi >= 0 && emi != mi) ? yvt_forwarded_value(c, emi) : TY_UNKNOWN;
       if (ft == TY_VOID) ft = TY_NIL;
       if (ft == TY_UNKNOWN && emi >= 0 && c->scopes[emi].is_proc_form) pf_fwd = 1;
       if (c->scopes[mi].yields || c->scopes[mi].is_lowered_yield) {
@@ -1960,6 +1930,20 @@ static int method_block_presence(Compiler *c, int mi) {
   return with ? 1 : 0;
 }
 
+TyKind dispatch_ret_over(Compiler *c, int cid, const char *name, int cmeth, int base_mi, TyKind r,
+                         int call_id) {
+  int nd = 0;
+  const int *ds = comp_descendants(c, cid, &nd);
+  for (int i = 0; i < nd; i++) {
+    int kmi = cmeth ? comp_cmethod_in_chain(c, ds[i], name, NULL)
+                    : comp_method_in_chain(c, ds[i], name, NULL);
+    if (kmi < 0 || kmi == base_mi) continue;
+    r = ty_unify(r, call_id >= 0 && c->scopes[kmi].yields ? method_call_ret(c, kmi, call_id)
+                                                          : (TyKind)c->scopes[kmi].ret);
+  }
+  return r;
+}
+
 TyKind method_call_ret(Compiler *c, int mi, int call_id) {
   int last = scope_body_last(c, mi);
   /* `if block_given? ... yield ... else ... end`: the call with a block
@@ -2001,7 +1985,7 @@ TyKind method_call_ret(Compiler *c, int mi, int call_id) {
       Scope *encl = comp_scope_of(c, call_id);
       int emi = encl ? (int)(encl - c->scopes) : -1;
       if (emi >= 0 && emi != mi) {
-        TyKind ft = yield_value_type(c, emi);
+        TyKind ft = yvt_forwarded_value(c, emi);
         if (ft != TY_UNKNOWN && ft != TY_VOID) return ft;
       }
     }
@@ -2078,7 +2062,7 @@ int is_proc_literal(Compiler *c, int id) {
   if (nt_ref(nt, id, "block") < 0) return 0;
   const char *name = nt_str(nt, id, "name");
   int recv = nt_ref(nt, id, "receiver");
-  if (recv < 0 && name && (sp_streq(name, "proc") || sp_streq(name, "lambda"))) return 1;
+  if (recv < 0 && name && (is_proc_constructor(name))) return 1;
   if (recv >= 0 && name && sp_streq(name, "new") && is_proc_constant(nt, recv)) return 1;
   return 0;
 }
@@ -2158,9 +2142,7 @@ int is_handler_proc_block(Compiler *c, int id) {
   }
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
       nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "ENV") &&
-      (sp_streq(name, "delete_if") || sp_streq(name, "reject!") ||
-       sp_streq(name, "keep_if") || sp_streq(name, "select!") ||
-       sp_streq(name, "filter!")))
+      is_select_bang(name))
     return 1;
   return 0;
 }
@@ -2312,6 +2294,18 @@ int comp_self_call_mi(Compiler *c, int id, const char *name) {
   return mi;
 }
 
+int send_blind_recv_owns(Compiler *c, int recv, TyKind srt, const char *name) {
+  if (ty_is_object(srt))
+    return comp_method_in_chain(c, ty_object_class(srt), name, NULL) >= 0 ||
+           comp_reader_in_chain(c, ty_object_class(srt), name, NULL);
+  /* a class named by a constant (or `self.class`): its own class methods
+     come before Object's private top-level def */
+  NodeKind rk = nt_kind(c->nt, recv);
+  int ci = rk == NK_ConstantReadNode || rk == NK_ConstantPathNode
+           ? comp_class_index(c, nt_str(c->nt, recv, "name")) : self_class_static_ci(c, recv);
+  return ci >= 0 && comp_cmethod_in_chain(c, ci, name, NULL) >= 0;
+}
+
 /* A receiverless call directly in a class body is sent to the class. */
 int comp_cbody_call_mi(Compiler *c, int id, const char *name) {
   Scope *s = comp_scope_of(c, id);
@@ -2389,10 +2383,15 @@ static int method_obj_target_mi_raw(Compiler *c, int node) {
       return ci >= 0 ? comp_method_in_chain(c, ci, sym, NULL) : -1;
     }
   }
-  if (recv < 0) {
-    int mi = comp_method_index(c, sym);
-    if (mi < 0) { Scope *s = comp_scope_of(c, node); if (s && s->class_id >= 0) mi = comp_method_in_chain(c, s->class_id, sym, NULL); }
-    return mi;
+  /* a bare `method(:m)` names what a bare `m` would call: inside a class
+     method self is the class, so its class methods come first (Ruby's
+     method lookup, comp_self_call_mi) */
+  if (recv < 0) return comp_self_call_mi(c, node, sym);
+  /* `self.method(:m)` in a class method: self is the class */
+  if (nt_kind(nt, recv) == NK_SelfNode) {
+    Scope *ss = comp_scope_of(c, node);
+    if (ss && ss->is_cmethod && ss->class_id >= 0)
+      return comp_cmethod_in_chain(c, ss->class_id, sym, NULL);
   }
   TyKind rt = infer_type(c, recv);
   /* a receiver whose method() was retargeted at a synthesized __bam_* wrapper
@@ -2409,6 +2408,12 @@ static int method_obj_target_mi_raw(Compiler *c, int node) {
     const char *rn2 = nt_str(nt, recv, "name");
     int ci2 = rn2 ? comp_class_index(c, rn2) : -1;
     if (ci2 >= 0) return comp_cmethod_in_chain(c, ci2, sym, NULL);
+  }
+  /* `self.class.method(:cmeth)` in an instance method of a class nothing
+     inherits from: that class's class-side method */
+  if (rt == TY_CLASS) {
+    int ci3 = self_class_static_ci(c, recv);
+    if (ci3 >= 0) return comp_cmethod_in_chain(c, ci3, sym, NULL);
   }
   return -1;
 }
@@ -2489,11 +2494,11 @@ TyKind method_obj_adapter_ret(TyKind arr, const char *op) {
   if (!op) return TY_UNKNOWN;
   if (arr == TY_INT_ARRAY) {
     if (sp_streq(op, "push")) return TY_INT_ARRAY;
-    if (sp_streq(op, "[]") || sp_streq(op, "[]=")) return TY_INT;
+    if (is_element_access(op)) return TY_INT;
   }
   else if (arr == TY_STR_ARRAY) {
     if (sp_streq(op, "push")) return TY_STR_ARRAY;
-    if (sp_streq(op, "[]") || sp_streq(op, "[]=")) return TY_STRING;
+    if (is_element_access(op)) return TY_STRING;
   }
   return TY_UNKNOWN;
 }
@@ -2866,7 +2871,7 @@ static const char *const io_family[] = {
   "UNIXSocket", "Socket", "BasicSocket", NULL };
 int io_family_name(const char *n) {
   if (!n) return 0;
-  if (sp_streq(n, "File") || sp_streq(n, "IO")) return 1;
+  if (is_io_class_name(n)) return 1;
   /* a socket class is the builtin only once the program loads socket */
   if (!sp_feature_required("socket")) return 0;
   for (int i = 2; io_family[i]; i++) if (sp_streq(n, io_family[i])) return 1;

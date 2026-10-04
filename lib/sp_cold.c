@@ -1294,6 +1294,7 @@ const char *sp_backtick(const char *cmd) {SP_GC_ROOT_STR(cmd);
     if (sp_sched_wait_child((int)pid, &st) < 0) st = -1; }
   /* the same wait-status layout sp_system_args leaves in $? */
   sp_last_status = st;
+  sp_last_pid = (int)pid;
   char *r = sp_str_alloc(len);
   if (len) memcpy(r, buf, len);
   r[len] = 0;
@@ -1682,6 +1683,7 @@ sp_int sp_File_sysseek(sp_File *f, sp_int off, sp_int whence);
 sp_RbVal sp_File_flock(sp_File *f, sp_int op);
 sp_int sp_File_fsync(sp_File *f);
 sp_RbVal sp_File_putc(sp_File *f, sp_RbVal v);
+SP_NORETURN void sp_raise_nil_to_int(int of_wording);
 const char *sp_file_ftype(const char *path);
 sp_bool sp_file_readable(const char *path);
 sp_bool sp_file_writable(const char *path);
@@ -1931,7 +1933,13 @@ sp_int sp_File_fsync(sp_File *f) {
 sp_RbVal sp_File_putc(sp_File *f, sp_RbVal v) {
   SP_IO_OPEN(f);
   if (v.tag == SP_TAG_INT) fputc((int)(v.v.i & 0xff), f->fp);
-  else if (v.tag == SP_TAG_STR && v.v.s && v.v.s[0]) fputc(v.v.s[0], f->fp);
+  else if (v.tag == SP_TAG_STR) { if (v.v.s && v.v.s[0]) fputc(v.v.s[0], f->fp); }
+  /* anything else is no character: CRuby converts it as an Integer and
+     raises for nil (the boxed nil wrote nothing and answered nil) */
+  else if (v.tag == SP_TAG_NIL) sp_raise_nil_to_int(0);
+  else if (v.tag == SP_TAG_FLT && v.v.f > -9.0e18 && v.v.f < 9.0e18) fputc((int)((sp_int)v.v.f & 0xff), f->fp);
+  else if (v.tag == SP_TAG_BOOL)
+    sp_raise_cls("TypeError", v.v.b ? "no implicit conversion of true into Integer" : "no implicit conversion of false into Integer");
   return v;
 }
 const char *sp_file_ftype(const char *path) {SP_GC_ROOT_STR(path);
@@ -3112,6 +3120,12 @@ sp_RbVal sp_Enumerator_size(sp_Enumerator *e) {SP_GC_ROOT(e);
   if (e->gen_label) return sp_box_nil();
   /* an argless cycle is endless unless there is nothing to repeat */
   if (e->endless) return (e->items && e->items->len > 0) ? sp_box_float(1.0 / 0.0) : sp_box_int(0);
+  /* the index searches stop at their first hit, so CRuby gives their
+     Enumerator no size; nor gsub's or gsub!'s */
+  if (e->meth && (strcmp(e->meth, "index") == 0 || strcmp(e->meth, "rindex") == 0 ||
+                  strcmp(e->meth, "find_index") == 0 ||
+                  strncmp(e->meth, "gsub(", 5) == 0 || strncmp(e->meth, "gsub!(", 6) == 0))
+    return sp_box_nil();
   if (e->items) return sp_box_int(e->items->len);
   if (e->size.tag == SP_TAG_OBJ && e->size.cls_id == SP_BUILTIN_PROC) {
     (void)sp_proc_call((sp_Proc *)e->size.v.p, 0, NULL);
@@ -3120,6 +3134,18 @@ sp_RbVal sp_Enumerator_size(sp_Enumerator *e) {SP_GC_ROOT(e);
   return e->size;
 }
 sp_RbVal sp_Enumerator_size_p(void *e) { return sp_Enumerator_size((sp_Enumerator *)e); }
+/* A boxed index search's or substitution's Enumerator (`a.index`,
+   `s.gsub!(re)` reached through a branch): its each block picks an index
+   or is the replacement, which the generic element walk does not compute,
+   so say so rather than answer the receiver. One read straight off its
+   call is rewritten to the block form before it gets here. */
+void sp_enum_index_search_each_raise(void *p) {
+  const char *em = ((sp_Enumerator *)p)->meth;
+  if (em && (strcmp(em, "index") == 0 || strcmp(em, "rindex") == 0 || strcmp(em, "find_index") == 0 ||
+             strncmp(em, "gsub(", 5) == 0 || strncmp(em, "gsub!(", 6) == 0))
+    sp_raise_cls("NotImplementedError",
+                 sp_sprintf("spinel: each on a boxed %s Enumerator is not supported", em));
+}
 
 /* ---- ENV core (StrStrHash-backed, #2832/#2842) + GC.stat + String#setbyte
    COW -- relocated from spinel_rt.h. All reach only lib-visible helpers
@@ -3298,12 +3324,37 @@ sp_bool sp_range_include(sp_Range *r, sp_int x){SP_GC_ROOT(r);
     if (r->last != INTPTR_MAX && (r->excl ? x >= r->last : x > r->last)) return 0;
     return 1;
   }
+  /* a Float end: an Integer is in it when the walk reaches it */
+  if (r->fe) return x >= r->first && (r->excl ? x < r->last : x <= r->last);
   sp_int lo=sp_range_min_v(*r),hi=sp_range_max_v(*r);
   return sp_range_count(*r)>0 && lo<=x && x<=hi;
 }
 /* A Float is compared against the bounds as a Float, never truncated: 2.5 is
    not in 1..2. The sentinels leave their side open, as in sp_range_include. */
-sp_bool sp_range_cover_f(sp_Range *r, sp_float x){return (r->first==INTPTR_MIN||x>=(sp_float)r->first)&&(r->last==INTPTR_MAX||(r->excl?x<(sp_float)r->last:x<=(sp_float)r->last));}
+sp_bool sp_range_cover_f(sp_Range *r, sp_float x){
+  if (r->fe) return (r->first==INTPTR_MIN||x>=(sp_float)r->first)&&(r->fe==2?x<r->fend:x<=r->fend);
+  return (r->first==INTPTR_MIN||x>=(sp_float)r->first)&&(r->last==INTPTR_MAX||(r->excl?x<(sp_float)r->last:x<=(sp_float)r->last));}
+sp_Range sp_range_new_fend(sp_int f, sp_float e, sp_int x) {
+  sp_Range r = sp_range_new(f, 0, 0);
+  r.fend = e; r.fe = x ? 2 : 1;
+  sp_float fl = floor(e);
+  if (e != e) { r.last = f - 1; return r; }             /* NaN: nothing compares */
+  if (fl >= 9.2e18) { r.last = INTPTR_MAX; return r; }  /* past sp_int: no end to walk to */
+  if (fl <= -9.2e18) { r.last = f - 1; return r; }
+  r.last = (sp_int)fl;
+  if (x && fl == e) r.excl = 1;                         /* 1...3.0 stops before 3 */
+  return r;
+}
+/* Range#max of an Integer range whose end is a Float (and not empty): an
+   excluded Float end has no greatest member, as CRuby says; an included
+   one is the maximum, a Float an Integer slot cannot hold. */
+void sp_range_fend_unsupported(const char *m) {
+  sp_raise_cls("NotImplementedError", sp_sprintf("%s: this Range's end is a Float, which spinel answers here only in Integers", m));
+}
+void sp_range_fend_max_raise(sp_Range r) {
+  if (r.fe == 2) sp_raise_cls("TypeError", "cannot exclude non Integer end value");
+  sp_raise_cls("NotImplementedError", "Range#max: this Range's end is a Float, which spinel reads here as an Integer");
+}
 /* Render a Range for a RangeError message ("-10..1", "1...3", "-10..", "..2"). */
 /* Range#inspect: as #to_s, except that a range with NO bound at either end
    names them -- CRuby prints "nil..nil", not ".." (#3670). */
@@ -3313,6 +3364,7 @@ const char *sp_range_inspect(sp_Range r) {
   return sp_range_str(r);
 }
 const char *sp_range_str(sp_Range r) {
+  if (r.fe) return sp_sprintf("%lld%s%s", (long long)r.first, r.fe == 2 ? "..." : "..", sp_float_to_s(r.fend));
   const char *dots = r.excl ? "..." : "..";
   if (r.first == INTPTR_MIN && r.last == INTPTR_MAX) return dots;
   if (r.first == INTPTR_MIN) return sp_sprintf("%s%lld", dots, (long long)r.last);
@@ -3576,6 +3628,38 @@ sp_bool sp_srange_cover(sp_StrRange r, const char *x) {
   if (r.first && strcmp(x, r.first) < 0) return 0;
   if (r.last) { int d = strcmp(x, r.last); if (r.excl ? d >= 0 : d > 0) return 0; }
   return 1;
+}
+/* #min / #max with no block, as CRuby's range_min / range_max: an open
+   side raises, an empty range (the begin past the end, or at it with the
+   end excluded) is nil, and an excluded end walks the members for the
+   least or greatest, since a String end cannot be stepped back from. NULL
+   is nil. */
+static const char *sp_srange_walk_extreme(sp_StrRange r, int greatest) {
+  sp_StrArray *a = sp_srange_to_a(r); SP_GC_ROOT(a);
+  const char *best = NULL; SP_GC_ROOT_STR(best);
+  for (sp_int i = 0; i < sp_StrArray_length(a); i++) {
+    const char *s = sp_StrArray_get(a, i);
+    if (!best || (greatest ? strcmp(s, best) > 0 : strcmp(s, best) < 0)) best = s;
+  }
+  return best;
+}
+const char *sp_srange_min_v(sp_StrRange r) {
+  if (!r.first) sp_raise_cls("RangeError", "cannot get the minimum of beginless range");
+  if (r.excl) {
+    if (!r.last) sp_raise_cls("RangeError", "cannot get the minimum of endless range with custom comparison method");
+    return sp_srange_walk_extreme(r, 0);
+  }
+  if (r.last && strcmp(r.first, r.last) > 0) return NULL;
+  return r.first;
+}
+const char *sp_srange_max_v(sp_StrRange r) {
+  if (!r.last) sp_raise_cls("RangeError", "cannot get the maximum of endless range");
+  if (r.excl) {
+    if (!r.first) sp_raise_cls("RangeError", "cannot get the maximum of beginless range with custom comparison method");
+    return sp_srange_walk_extreme(r, 1);
+  }
+  if (r.first && strcmp(r.first, r.last) > 0) return NULL;
+  return r.last;
 }
 const char *sp_srange_to_s(sp_StrRange r) {
   return sp_sprintf("%s%s%s", r.first ? r.first : sp_str_empty,
@@ -4606,6 +4690,12 @@ SP_NORETURN void sp_raise_nil_cmp(int left_nil, const char *op, const char *cls)
 SP_NORETURN void sp_raise_nil_to_int(int of_wording) {
   sp_raise_cls("TypeError", of_wording ? "no implicit conversion of nil into Integer"
                                        : "no implicit conversion from nil to integer");
+}
+
+/* A real -2^63 headed for a slot that can also hold nil: the slot's nil is
+   that very word (SP_INT_NIL), so the store would read back as nil. */
+SP_NORETURN void sp_raise_int_min_slot(void) {
+  sp_raise_cls("RangeError", "integer -9223372036854775808 collides with the nil of a nullable Integer slot");
 }
 
 SP_NORETURN void sp_raise_nil_float_op(int left_nil, const char *op) {SP_GC_ROOT_STR(op);

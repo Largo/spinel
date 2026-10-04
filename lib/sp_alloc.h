@@ -692,6 +692,10 @@ void *sp_pl_realloc(void *p, size_t newn);   /* lib/sp_slab.c: a slab block know
                                            that asserts every id is distinct will
                                            flag any future collision at compile
                                            time. */
+#define SP_BUILTIN_RANDOM        (-50)  /* Random (sp_Random *): boxed so a
+                                           generator in an Array or a poly slot
+                                           keeps its identity; it read as nil */
+/* SP_BUILTIN_ARGF (-51) is in sp_gc.h: the collector must not trace it */
 #define SP_BUILTIN_YIELDER       (-49)  /* Enumerator::Yielder: the generator's
                                           block parameter as a VALUE, for a
                                           proc inside the body that captures
@@ -750,6 +754,45 @@ extern size_t sp_gc_threshold;
 extern size_t sp_gc_threshold_init;
 extern int sp_gc_stress_checked;
 void *sp_gc_alloc(size_t sz, void (*fin)(void *), void (*scn)(void *));
+/* sp_gc_alloc(sz, NULL, scn) for a size that is a constant where it is
+   called: the switch folds to one call, of the front lib/sp_slab.c keeps for
+   that size class (16 bytes apart from 32 to 256, the header included). */
+void *sp_gc_alloc_32(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_48(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_64(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_80(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_96(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_112(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_128(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_144(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_160(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_176(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_192(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_208(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_224(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_240(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_256(size_t need, void (*scn)(void *));
+static inline void *sp_gc_alloc_sized(size_t sz, void (*scn)(void *)) {
+  size_t need = sizeof(sp_gc_hdr) + sz;
+  switch (need <= 32 ? 0 : need > 256 ? -1 : (int)((need + 15) >> 4) - 2) {
+  case 0: return sp_gc_alloc_32(need, scn);
+  case 1: return sp_gc_alloc_48(need, scn);
+  case 2: return sp_gc_alloc_64(need, scn);
+  case 3: return sp_gc_alloc_80(need, scn);
+  case 4: return sp_gc_alloc_96(need, scn);
+  case 5: return sp_gc_alloc_112(need, scn);
+  case 6: return sp_gc_alloc_128(need, scn);
+  case 7: return sp_gc_alloc_144(need, scn);
+  case 8: return sp_gc_alloc_160(need, scn);
+  case 9: return sp_gc_alloc_176(need, scn);
+  case 10: return sp_gc_alloc_192(need, scn);
+  case 11: return sp_gc_alloc_208(need, scn);
+  case 12: return sp_gc_alloc_224(need, scn);
+  case 13: return sp_gc_alloc_240(need, scn);
+  case 14: return sp_gc_alloc_256(need, scn);
+  default: return sp_gc_alloc(sz, NULL, scn);
+  }
+}
 void *sp_gc_alloc_nogc(size_t sz, void (*fin)(void *), void (*scn)(void *));
 
 SP_NORETURN void sp_raise_cls(const char *cls, const char *msg);  /* lib/sp_core.c */
@@ -987,7 +1030,9 @@ static inline sp_RbVal sp_box_range(sp_Range v) {
   return sp_box_obj(p, SP_BUILTIN_RANGE);
 }
 static inline const char*sp_encoding_name(sp_Encoding e){return e.name?e.name:sp_str_empty;}
-static inline const char*sp_encoding_inspect(sp_Encoding e){return sp_sprintf("#<Encoding:%s>",sp_encoding_name(e));}
+/* Encoding#inspect: the binary encoding reads "BINARY (ASCII-8BIT)" since Ruby 3.4 */
+static inline const char*sp_encoding_inspect_name(const char*n){return !strcmp(n,"ASCII-8BIT")?sp_sprintf("#<Encoding:BINARY (ASCII-8BIT)>"):sp_sprintf("#<Encoding:%s>",n);}
+static inline const char*sp_encoding_inspect(sp_Encoding e){return sp_encoding_inspect_name(sp_encoding_name(e));}
 static inline sp_bool sp_encoding_eq(sp_Encoding a,sp_Encoding b){const char*an=sp_encoding_name(a);const char*bn=sp_encoding_name(b);return strcmp(an,bn)==0;}
 
 /* ---- Box helper prototypes (0 optcarrot uses; bodies in lib/sp_cold.c). ---- */

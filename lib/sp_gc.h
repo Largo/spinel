@@ -36,6 +36,8 @@
 /* a compiled Regexp: malloc-owned (never GC heap), so like FOREIGN_PTR the
    collector must not trace it */
 #define SP_BUILTIN_REGEX       (-33)
+/* ARGF: the one static sp_argf_obj, never GC heap, so it is not traced */
+#define SP_BUILTIN_ARGF        (-51)
 /* Wide value types (heap-copied crossing into a poly slot). Shared here so
    lib/sp_marshal.c can recognize them by cls_id. */
 #define SP_BUILTIN_COMPLEX  (-26)
@@ -420,6 +422,10 @@ extern SP_TLS unsigned long sp_slab_frees;   /* this thread's explicit frees, co
 void  sp_slab_epoch_flip(void);          /* under the barrier: new allocations go to the other parity */
 void  sp_slab_runs_release(void);
 void  sp_slab_history(const void *p);    /* SPINEL_GC_VERIFY: print a slot's recorded events */
+/* SPINEL_GC_STRESS=2 (lib/sp_slab.c): what dies is poisoned and kept out of reuse */
+extern int sp_slab_quar_on;
+int   sp_slab_is_quarantined(const void *p);
+void  sp_slab_quarantine_trim(void);     /* under the barrier: a quarantine past its size is let go */
 extern int sp_gc_alloc_fast_ok;         /* sp_gc_alloc's lean front may run: drop to 0 to route every allocation through the full form */        /* under the barrier: the workers' claimed-not-allocated runs are unclaimed */
 typedef struct { size_t freed_obj, freed_str, freed_slots, slots, swept, kept_young, parked; } sp_slab_sweep_stats;   /* swept: finalizers run; parked: bytes of headers held by their pools */
 /* one worker's chunks: frees what the closed epoch holds unmarked (and,
@@ -675,7 +681,7 @@ static inline void sp_mark_rbval(sp_RbVal v) {
      strings and mark as nothing. */
   else if (v.tag == SP_TAG_CLASS && v.cls_id == SP_CLASS_BY_NAME) sp_mark_string(v.v.s);
   else if (v.tag == SP_TAG_OBJ && v.cls_id != SP_BUILTIN_FOREIGN_PTR &&
-           v.cls_id != SP_BUILTIN_REGEX) sp_gc_mark(v.v.p);
+           v.cls_id != SP_BUILTIN_REGEX && v.cls_id != SP_BUILTIN_ARGF) sp_gc_mark(v.v.p);
   else if (v.tag == SP_TAG_BIGINT) sp_gc_mark(v.v.p);
 }
 /* A scratch root: the proc calling convention's side channel keeps its last
@@ -687,7 +693,7 @@ static inline void sp_mark_rbval(sp_RbVal v) {
 static inline void sp_mark_rbval_scratch(sp_RbVal v) {
   const void *h = NULL;
   if (v.tag == SP_TAG_STR || (v.tag == SP_TAG_CLASS && v.cls_id == SP_CLASS_BY_NAME)) { if (v.v.s && ((unsigned char)v.v.s[-1] | 0x04) == 0xfe) h = ((const sp_str_hdr *)(v.v.s - 1)) - 1; }
-  else if ((v.tag == SP_TAG_OBJ && v.cls_id != SP_BUILTIN_FOREIGN_PTR && v.cls_id != SP_BUILTIN_REGEX) || v.tag == SP_TAG_BIGINT) { if (v.v.p) h = (const char *)v.v.p - sizeof(sp_gc_hdr); }
+  else if ((v.tag == SP_TAG_OBJ && v.cls_id != SP_BUILTIN_FOREIGN_PTR && v.cls_id != SP_BUILTIN_REGEX && v.cls_id != SP_BUILTIN_ARGF) || v.tag == SP_TAG_BIGINT) { if (v.v.p) h = (const char *)v.v.p - sizeof(sp_gc_hdr); }
   if (h && sp_slab_owns(h) && !sp_slab_is_live(h)) return;
   sp_mark_rbval(v);
 }
