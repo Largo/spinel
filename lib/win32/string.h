@@ -10,6 +10,9 @@ extern "C" {
 #endif
 char *sp_w32_strerror(int e);
 #define strerror(e) sp_w32_strerror(e)
+/* MinGW-w64 before v14 (RubyInstaller's Devkit among them) has no strndup */
+char *sp_w32_strndup(const char *s, size_t n);
+#define strndup(s, n) sp_w32_strndup(s, n)
 #ifdef __cplusplus
 }
 #endif

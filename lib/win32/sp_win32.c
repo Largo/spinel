@@ -92,6 +92,7 @@ int sp_w32_is_socket_handle(HANDLE h);
 #undef mkdir
 #undef chmod
 #undef strerror
+#undef strndup
 #undef nanosleep
 #undef execv
 #undef execvp
@@ -102,6 +103,15 @@ int sp_w32_is_socket_handle(HANDLE h);
 /* ===================================================================== */
 /* errno from a Win32 error                                              */
 /* ===================================================================== */
+
+char *sp_w32_strndup(const char *s, size_t n) {
+  size_t len = strnlen(s, n);
+  char *r = malloc(len + 1);
+  if (!r) { errno = ENOMEM; return NULL; }
+  memcpy(r, s, len);
+  r[len] = '\0';
+  return r;
+}
 
 /* glibc's strerror texts */
 char *sp_w32_strerror(int e) {
