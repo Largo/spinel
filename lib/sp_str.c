@@ -155,6 +155,23 @@ static inline char *sp_str_bin_from(char *r, const char *a) {
   return r;
 }
 
+/* One step of CRuby's encoding rule over a string built part by part (an
+   interpolation, Array#join): `state` is the encoding so far, -1 while only
+   US-ASCII parts (an Integer's to_s, nothing yet) have gone in, 0 UTF-8, 1
+   binary; `acc` holds the `acc_len` bytes already joined. A part in the same
+   encoding, or an ASCII-only one, keeps it; one whose high bytes meet an
+   ASCII-only run so far takes the run over; two runs with high bytes in
+   different encodings stay binary (see above). */
+int sp_str_enc_step(int state, const char *acc, size_t acc_len, const char *part, size_t part_len, int part_bin) {
+  if (state < 0) return part_len ? part_bin : -1;
+  if (part_bin == state || part_len == 0) return state;
+  for (size_t i = 0; i < part_len; i++)
+    if ((unsigned char)part[i] >= 0x80) {
+      for (size_t j = 0; j < acc_len; j++) if ((unsigned char)acc[j] >= 0x80) return 1;
+      return part_bin;
+    }
+  return state;
+}
 /* Whether a + b is binary, as CRuby's compatibility rule picks it: the
    operands' shared encoding, else the one an ASCII-only operand gives way
    to -- `String.new + "\u00e9"` is UTF-8 -- else binary (see above). */
@@ -1212,7 +1229,7 @@ static size_t sp_str_unit_offset(const char *s, sp_int n) {
 sp_int sp_str_index(const char*s,const char*sub){if(!s)sp_nil_recv("index");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");const char*f=sp_bytestr(s,sp_str_byte_len(s),sub,sp_str_byte_len(sub));if(!f)return -1;return sp_str_units_between(s,s,f);}
 /* Issue #758: NULL guard + bound the start so a negative result from
    sp_str_index doesn't underflow the source pointer. */
-sp_int sp_str_index_from(const char*s,const char*sub,sp_int start){if(!s)sp_nil_recv("index");sp_int cl=sp_str_length(s);if(start<0)start+=cl;if(start<0)start=0;if(start>cl)return -1;size_t boff=sp_str_unit_offset(s,start);const char*f=sp_bytestr(s+boff,sp_str_byte_len(s)-boff,sub,sp_str_byte_len(sub));if(!f)return -1;return start+sp_str_units_between(s,s+boff,f);}
+sp_int sp_str_index_from(const char*s,const char*sub,sp_int start){if(!s)sp_nil_recv("index");sp_int cl=sp_str_length(s);if(start<0)start+=cl;if(start<0)return -1;if(start>cl)return -1;size_t boff=sp_str_unit_offset(s,start);const char*f=sp_bytestr(s+boff,sp_str_byte_len(s)-boff,sub,sp_str_byte_len(sub));if(!f)return -1;return start+sp_str_units_between(s,s+boff,f);}
 /* `s.rindex(sub)` -- rightmost occurrence of sub; returns a codepoint
    offset, or -1 if not found. Empty sub matches at the end. */
 sp_int sp_str_rindex(const char*s,const char*sub){if(!s)sp_nil_recv("rindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");size_t sl=sp_str_byte_len(sub);if(sl==0)return sp_str_length(s);size_t hn=sp_str_byte_len(s);const char*end=s+hn;const char*last=NULL;const char*p=s;while(p<end){const char*f=sp_bytestr(p,(size_t)(end-p),sub,sl);if(!f)break;last=f;p=f+1;}if(!last)return -1;return sp_str_units_between(s,s,last);}

@@ -600,6 +600,18 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       emit_time_in_zone(c, ts, struct_kwarg_value(c, argv[0], "in"), b);
       return 1;
     }
+    /* Time.at(x, *rest) and any other spread: every argument into one list,
+       which the runtime reads as Time.at's arguments, as for a lone splat */
+    if (sp_streq(name, "at") && argc >= 2) {
+      int any_splat = 0;
+      for (int k = 0; k < argc; k++) if (nt_kind(nt, argv[k]) == NK_SplatNode) any_splat = 1;
+      if (any_splat) {
+        buf_puts(b, "({ ");
+        int tf = emit_bm_flat_args(c, argv, argc, b);
+        buf_printf(b, " sp_time_at_args(sp_box_poly_array(_t%d)); })", tf);
+        return 1;
+      }
+    }
     /* Time.at(*args): the runtime reads the list as Time.at's arguments */
     if (sp_streq(name, "at") && argc == 1 && nt_kind(nt, argv[0]) == NK_SplatNode &&
         nt_ref(nt, argv[0], "expression") >= 0) {
@@ -790,6 +802,14 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     }
     if (sp_streq(name, "compact") && argc == 0) { buf_puts(b, "(sp_gc_collect_request(), (sp_int)0)"); return 1; }
     if (sp_streq(name, "stat") && argc == 0) { buf_puts(b, "sp_gc_stat()"); return 1; }
+    /* the time every collection so far took (sp_gc_stat_seconds), in
+       nanoseconds as CRuby answers it */
+    if (sp_streq(name, "total_time") && argc == 0) { buf_puts(b, "((sp_int)(sp_gc_stat_seconds * 1e9))"); return 1; }
+    /* GC.stat(key): the one statistic, ArgumentError for a key not kept */
+    if (sp_streq(name, "stat") && argc == 1 && nt_kind(nt, argv[0]) != NK_KeywordHashNode) {
+      buf_puts(b, "sp_gc_stat_key("); emit_boxed(c, argv[0], b); buf_puts(b, ")");
+      return 1;
+    }
   }
 
   /* Fiber class methods: Fiber.yield(val) and Fiber.current */
@@ -1806,6 +1826,7 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
 
   /* Random instance methods */
   if (recv >= 0 && comp_ntype(c, recv) == TY_RANDOM) {
+    if (emit_builtin_op(c, id, recv, TY_RANDOM, name, b)) return 1;
     if (sp_streq(name, "rand")) {
       if (argc >= 1 && comp_ntype(c, argv[0]) == TY_FLOAT) {
         buf_puts(b, "sp_Random_rand_float_bound("); emit_expr(c, recv, b); buf_puts(b, ", ");
@@ -1865,15 +1886,6 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       else {
         buf_puts(b, "sp_Random_rand_float("); emit_expr(c, recv, b); buf_puts(b, ")");
       }
-      return 1;
-    }
-    if (sp_streq(name, "bytes") && argc == 1) {
-      buf_puts(b, "sp_Random_bytes("); emit_expr(c, recv, b); buf_puts(b, ", ");
-      emit_int_expr_conv(c, argv[0], b); buf_puts(b, ")");
-      return 1;
-    }
-    if (sp_streq(name, "seed") && argc == 0) {   /* #2522 */
-      buf_puts(b, "sp_Random_seed("); emit_expr(c, recv, b); buf_puts(b, ")");
       return 1;
     }
     if ((is_text_conversion(name)) && argc == 0) {

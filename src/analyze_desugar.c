@@ -221,7 +221,7 @@ int desugar_class_body_bare_new(Compiler *c) {
    has no const_get, so that is left for the ordinary NoMethodError. */
 int desugar_bare_class_self_calls(Compiler *c) {
   static const struct { const char *name; int argc; } surf[] = {
-    { "const_get", -1 }, { "superclass", 0 }, { "ancestors", 0 },
+    { "const_get", -1 }, { "superclass", 0 }, { "ancestors", 0 }, { "subclasses", 0 },
     { "include?", 1 }, { "to_s", 0 }, { "inspect", 0 }, { "frozen?", 0 },
   };
   NodeTable *nt = (NodeTable *)c->nt;
@@ -3440,6 +3440,31 @@ static int engine_splice_list(NodeTable *nt, int body) {
   return changed;
 }
 
+/* `def m = (a; b)`: a def whose whole body is one parenthesized sequence
+   is that sequence's statements, as CRuby runs it. Left wrapped, the
+   method's value was the parentheses' rather than its last statement's, so
+   a yield there was typed once for every call site, and a call whose block
+   answers another kind stored the value in the first site's carrier. */
+int desugar_paren_def_body(Compiler *c) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  int changed = 0;
+  NT_FOREACH_KIND(nt, NK_DefNode, d) {
+    int body = nt_ref(nt, d, "body"), bn = 0;
+    const int *bb = body >= 0 && nt_kind(nt, body) == NK_StatementsNode ? nt_arr(nt, body, "body", &bn) : NULL;
+    if (bn != 1 || nt_kind(nt, bb[0]) != NK_ParenthesesNode) continue;
+    int pb = nt_ref(nt, bb[0], "body"), pn = 0;
+    const int *pd = pb >= 0 && nt_kind(nt, pb) == NK_StatementsNode ? nt_arr(nt, pb, "body", &pn) : NULL;
+    if (pn < 2) continue;
+    int *cp = malloc(sizeof(int) * (size_t)pn);
+    if (!cp) continue;
+    memcpy(cp, pd, sizeof(int) * (size_t)pn);
+    nt_node_set_arr(nt, body, "body", cp, pn);
+    free(cp);
+    changed = 1;
+  }
+  return changed;
+}
+
 int desugar_engine_branches(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
   int n0 = nt->count;
@@ -6585,13 +6610,33 @@ static int fwd_class_value_new_shape(const NodeTable *nt) {
 /* The number of arguments every call of `name` passes: -1 when they differ
    or one passes a splat, keywords or a `...` of its own, -2 when there is no
    call. */
+/* Does CallNode `id` call `name`: directly (*skip = 0), or through send,
+   __send__ or public_send with the name as a literal first argument
+   (*skip = 1, that argument is no argument of the callee's)? A forwarder's
+   callers were counted only when they spelled it directly, so
+   `o.send(:m, :x) { }` lost its block in the forwarder (#7213 sweep). */
+static int fwd_call_names(const NodeTable *nt, int id, const char *name, int *skip) {
+  const char *nm = nt_str(nt, id, "name");
+  *skip = 0;
+  if (!nm) return 0;
+  if (sp_streq(nm, name)) return 1;
+  if (!sp_streq(nm, "send") && !sp_streq(nm, "__send__") && !sp_streq(nm, "public_send")) return 0;
+  int ac = 0; const int *av = nt_arr(nt, nt_ref(nt, id, "arguments"), "arguments", &ac);
+  if (ac < 1 || !av) return 0;
+  const char *lit = fwd_node_is(nt, av[0], "SymbolNode") ? nt_str(nt, av[0], "value")
+                  : fwd_node_is(nt, av[0], "StringNode") ? nt_str(nt, av[0], "content") : NULL;
+  if (!lit || !sp_streq(lit, name)) return 0;
+  *skip = 1;
+  return 1;
+}
 static int fwd_fixed_call_arity(const NodeTable *nt, const char *name) {
   int n = -2;
   for (int id = 0; id < nt->count; id++) {
     if (!fwd_node_is(nt, id, "CallNode")) continue;
-    const char *nm = nt_str(nt, id, "name");
-    if (!nm || !sp_streq(nm, name)) continue;
+    int skip;
+    if (!fwd_call_names(nt, id, name, &skip)) continue;
     int ac = 0; const int *av = nt_arr(nt, nt_ref(nt, id, "arguments"), "arguments", &ac);
+    av += skip; ac -= skip;
     for (int k = 0; k < ac; k++)
       if (fwd_node_is(nt, av[k], "SplatNode") || fwd_node_is(nt, av[k], "KeywordHashNode") ||
           fwd_node_is(nt, av[k], "ForwardingArgumentsNode")) return -1;
@@ -6717,8 +6762,8 @@ static int def_exists_by_name(const NodeTable *nt, const char *name) {
 static int any_call_passes_block(const NodeTable *nt, const char *name) {
   for (int id = 0; id < nt->count; id++) {
     if (!fwd_node_is(nt, id, "CallNode")) continue;
-    const char *nm = nt_str(nt, id, "name");
-    if (nm && sp_streq(nm, name) && nt_ref(nt, id, "block") >= 0) return 1;
+    int skip;
+    if (fwd_call_names(nt, id, name, &skip) && nt_ref(nt, id, "block") >= 0) return 1;
   }
   return 0;
 }
@@ -7020,11 +7065,18 @@ static int dmp_instance_method_alias(NodeTable *nt, int call, const char *cn, in
   if (!sp_streq(cn, "define_method") || blk >= 0 || nt_kind(nt, src) != NK_CallNode) return 0;
   const char *nm = nt_str(nt, src, "name");
   int recv = nt_ref(nt, src, "receiver");
-  if (!nm || !sp_streq(nm, "instance_method") || nt_ref(nt, src, "block") >= 0 ||
-      (recv >= 0 && nt_kind(nt, recv) != NK_SelfNode)) return 0;
+  if (!nm || nt_ref(nt, src, "block") >= 0 || (recv >= 0 && nt_kind(nt, recv) != NK_SelfNode)) return 0;
   int sargs = nt_ref(nt, src, "arguments");
   int sn = 0; const int *sv = sargs >= 0 ? nt_arr(nt, sargs, "arguments", &sn) : NULL;
-  if (sn != 1 || nt_kind(nt, sv[0]) != NK_SymbolNode) return 0;
+  /* `send(:instance_method, :x)` (or __send__ / public_send) is the same
+     UnboundMethod; it was left as a call, and the method never defined */
+  if ((sp_streq(nm, "send") || sp_streq(nm, "__send__") || sp_streq(nm, "public_send")) &&
+      sn == 2 && nt_kind(nt, sv[0]) == NK_SymbolNode &&
+      sp_streq(nt_str(nt, sv[0], "value"), "instance_method")) {
+    nm = "instance_method";
+    sv++; sn--;
+  }
+  if (!sp_streq(nm, "instance_method") || sn != 1 || nt_kind(nt, sv[0]) != NK_SymbolNode) return 0;
   int args = nt_ref(nt, call, "arguments");
   int an = 0; const int *av = nt_arr(nt, args, "arguments", &an);
   if (nt_kind(nt, av[0]) == NK_StringNode) {
@@ -7358,11 +7410,11 @@ int desugar_anon_block_param(Compiler *c) {
 static int any_call_passes_keywords(const NodeTable *nt, const char *name) {
   for (int id = 0; id < nt->count; id++) {
     if (!fwd_node_is(nt, id, "CallNode")) continue;
-    const char *nm = nt_str(nt, id, "name");
-    if (!nm || !sp_streq(nm, name)) continue;
+    int skip;
+    if (!fwd_call_names(nt, id, name, &skip)) continue;
     int args = nt_ref(nt, id, "arguments");
     int ac = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
-    if (ac >= 1 && av && fwd_node_is(nt, av[ac - 1], "KeywordHashNode")) return 1;
+    if (ac >= 1 + skip && av && fwd_node_is(nt, av[ac - 1], "KeywordHashNode")) return 1;
   }
   return 0;
 }
@@ -7991,6 +8043,18 @@ int desugar_builtins(Compiler *c) {
       if (er >= 0 && nt_kind(nt, er) == NK_CallNode && nt_ref(nt, er, "block") < 0) cn0 = nt_str(nt, er, "name");
     }
     if (cn0 && sp_streq(cn0, "with_object")) cn0 = "each_with_object";
+    /* `recv.send(:tally)` / public_send / __send__ with a literal name is
+       retargeted onto `recv.tally` inside the fixpoint
+       (desugar_public_send_recv), after this pass: give it its copy under
+       the name it will have, or the retargeted call found no definition and
+       raised NoMethodError for an Array's own tally */
+    if (cn0 && (sp_streq(cn0, "send") || sp_streq(cn0, "public_send") || sp_streq(cn0, "__send__")) &&
+        nt_ref(nt, id, "receiver") >= 0) {
+      int sa = nt_ref(nt, id, "arguments"), sac = 0;
+      const int *sav = sa >= 0 ? nt_arr(nt, sa, "arguments", &sac) : NULL;
+      if (sac >= 1 && nt_kind(nt, sav[0]) == NK_SymbolNode && nt_str(nt, sav[0], "value"))
+        cn0 = nt_str(nt, sav[0], "value");
+    }
     /* collect_concat is flat_map under another name: the call takes the
        name the definition has (a program that defines collect_concat
        itself keeps its call) */
@@ -14423,6 +14487,25 @@ static int sce_bare_visibility(const NodeTable *nt, int st) {
   const char *m = nt_str(nt, st, "name");
   return m && (is_visibility_or_module_function(m));
 }
+/* `m(&nil)` passes no block: it is the blockless call. The `&nil` stayed a
+   block argument, and each arm that only asks "is there a block" took the
+   block form -- `"e".bytes(&nil)` answered the receiver, `[3, 1].sort(&nil)`
+   and `s.split(" ", &nil)` did not build (#7412). Dropped here, ahead of
+   every pass, so the call is read as it is written without one.
+   Not for super: `super(&nil)` passes no block where a bare `super(...)`
+   hands the caller's own block on, so there the &nil is meaningful. */
+void desugar_nil_block_arg(Compiler *c) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  int n0 = nt->count;
+  for (int id = 0; id < n0; id++) {
+    if (nt_kind(nt, id) != NK_CallNode) continue;
+    int blk = nt_ref(nt, id, "block");
+    if (blk < 0 || nt_kind(nt, blk) != NK_BlockArgumentNode) continue;
+    int ex = nt_ref(nt, blk, "expression");
+    if (ex >= 0 && nt_kind(nt, ex) == NK_NilNode) nt_node_set_ref(nt, id, "block", -1);
+  }
+}
+
 int desugar_static_class_eval(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
   int n0 = nt->count, changed = 0;
@@ -14738,6 +14821,117 @@ int desugar_builtin_reopen_self_class(Compiler *c) {
       if (nt_kind(nt, st) != NK_DefNode || nt_ref(nt, st, "receiver") >= 0) continue;
       changed |= bsc_walk(nt, nt_ref(nt, st, "body"), cname);
     }
+  }
+  free(top);
+  return changed;
+}
+
+/* A bare constructor call in a class method of a reopened Time -- `at`,
+   `now`, `utc`, ... -- is Time's own (self is Time there), as is a name the
+   reopening's `class << self` aliases one to before defining it
+   (activesupport's `alias_method :at_without_coercion, :at`). Spelled with
+   the receiver, the call reaches the builtin; bare, it was refused. */
+static int tsc_ctor(const char *nm) {
+  static const char *const C[] = { "at", "now", "utc", "gm", "local", "mktime", NULL };
+  for (int i = 0; C[i]; i++) if (sp_streq(nm, C[i])) return 1;
+  return 0;
+}
+typedef struct { const char *name[32]; const char *target[32]; int n; const char *defs[128]; int nd; } TscNames;
+static int tsc_defined(const TscNames *t, const char *nm) {
+  for (int i = 0; i < t->nd; i++) if (sp_streq(t->defs[i], nm)) return 1;
+  return 0;
+}
+static const char *tsc_target(const TscNames *t, const char *nm) {
+  if (tsc_defined(t, nm)) return NULL;
+  if (tsc_ctor(nm)) return nm;
+  for (int i = 0; i < t->n; i++) if (sp_streq(t->name[i], nm)) return t->target[i];
+  return NULL;
+}
+static int tsc_walk(NodeTable *nt, int n, const TscNames *t) {
+  if (n < 0) return 0;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_ClassNode || k == NK_ModuleNode || k == NK_SingletonClassNode || k == NK_DefNode) return 0;
+  if (k == NK_BlockNode || k == NK_LambdaNode) return 0;   /* may run under another self */
+  int changed = 0;
+  if (k == NK_CallNode && nt_ref(nt, n, "receiver") < 0) {
+    const char *nm = nt_str(nt, n, "name");
+    const char *tg = nm ? tsc_target(t, nm) : NULL;
+    if (tg) {
+      int r = nt_new_node(nt, "ConstantReadNode");
+      if (r >= 0) {
+        nt_node_set_str(nt, r, "name", "Time");
+        nt_node_set_ref(nt, n, "receiver", r);
+        if (!sp_streq(tg, nm)) nt_node_set_str(nt, n, "name", tg);
+        changed = 1;
+      }
+    }
+  }
+  const SpNode *nd = &nt->nodes[n];
+  int nr = nd->nr; int refs[64]; if (nr > 64) nr = 64;
+  for (int j = 0; j < nr; j++) refs[j] = nd->r[j].ref;
+  for (int j = 0; j < nr; j++) changed |= tsc_walk(nt, refs[j], t);
+  for (int j = 0; j < nt->nodes[n].na; j++) {
+    int an = nt->nodes[n].a[j].n;
+    int *ids = malloc(sizeof(int) * (size_t)(an + 1));
+    memcpy(ids, nt->nodes[n].a[j].ids, sizeof(int) * (size_t)an);
+    for (int q = 0; q < an; q++) changed |= tsc_walk(nt, ids[q], t);
+    free(ids);
+  }
+  return changed;
+}
+/* The class-method names the body defines (`def self.x`, defs in `class <<
+   self`) and the singleton aliases of a constructor made before any def of
+   the constructor's name. */
+static void tsc_collect(NodeTable *nt, int body, int in_sg, TscNames *t) {
+  int bn = 0; const int *bs = body >= 0 && nt_kind(nt, body) == NK_StatementsNode ? nt_arr(nt, body, "body", &bn) : NULL;
+  for (int k = 0; k < bn; k++) {
+    int st = bs[k];
+    NodeKind sk = nt_kind(nt, st);
+    if (sk == NK_DefNode && (in_sg || nt_ref(nt, st, "receiver") >= 0) && t->nd < 128) {
+      const char *dn = nt_str(nt, st, "name");
+      if (dn) t->defs[t->nd++] = dn;
+    }
+    else if (sk == NK_SingletonClassNode) tsc_collect(nt, nt_ref(nt, st, "body"), 1, t);
+    else if (in_sg && sk == NK_CallNode && nt_ref(nt, st, "receiver") < 0) {
+      const char *cn = nt_str(nt, st, "name");
+      int a = nt_ref(nt, st, "arguments"); int an = 0;
+      const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+      if (cn && sp_streq(cn, "alias_method") && an == 2 &&
+          nt_kind(nt, av[0]) == NK_SymbolNode && nt_kind(nt, av[1]) == NK_SymbolNode && t->n < 32) {
+        const char *nw = nt_str(nt, av[0], "value"), *od = nt_str(nt, av[1], "value");
+        if (nw && od && tsc_ctor(od) && !tsc_defined(t, od)) { t->name[t->n] = nw; t->target[t->n] = od; t->n++; }
+      }
+    }
+  }
+}
+static void tsc_rewrite(NodeTable *nt, int body, int in_sg, const TscNames *t, int *changed) {
+  int bn = 0; const int *bs = body >= 0 && nt_kind(nt, body) == NK_StatementsNode ? nt_arr(nt, body, "body", &bn) : NULL;
+  for (int k = 0; k < bn; k++) {
+    int st = bs[k];
+    NodeKind sk = nt_kind(nt, st);
+    if (sk == NK_DefNode && (in_sg || nt_ref(nt, st, "receiver") >= 0)) *changed |= tsc_walk(nt, nt_ref(nt, st, "body"), t);
+    else if (sk == NK_SingletonClassNode) tsc_rewrite(nt, nt_ref(nt, st, "body"), 1, t, changed);
+  }
+}
+int desugar_time_singleton_bare_ctor(Compiler *c) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  int changed = 0, n0 = nt->count;
+  char *top = calloc((size_t)(n0 > 0 ? n0 : 1), 1);
+  bsc_mark_toplevel(nt, nt->root_id, top);
+  TscNames t; memset(&t, 0, sizeof t);
+  for (int n = 0; n < n0; n++) {
+    if (nt_kind(nt, n) != NK_ClassNode || !top[n]) continue;
+    int cp = nt_ref(nt, n, "constant_path");
+    if (cp < 0 || nt_kind(nt, cp) != NK_ConstantReadNode || !nt_str(nt, cp, "name") ||
+        !sp_streq(nt_str(nt, cp, "name"), "Time")) continue;
+    tsc_collect(nt, nt_ref(nt, n, "body"), 0, &t);
+  }
+  for (int n = 0; n < n0; n++) {
+    if (nt_kind(nt, n) != NK_ClassNode || !top[n]) continue;
+    int cp = nt_ref(nt, n, "constant_path");
+    if (cp < 0 || nt_kind(nt, cp) != NK_ConstantReadNode || !nt_str(nt, cp, "name") ||
+        !sp_streq(nt_str(nt, cp, "name"), "Time")) continue;
+    tsc_rewrite(nt, nt_ref(nt, n, "body"), 0, &t, &changed);
   }
   free(top);
   return changed;
