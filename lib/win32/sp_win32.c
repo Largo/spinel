@@ -1688,6 +1688,10 @@ pid_t setsid(void) { return (pid_t)GetCurrentProcessId(); }
 pid_t getsid(pid_t pid) { return pid == 0 ? (pid_t)GetCurrentProcessId() : pid; }
 
 pid_t sp_w32_fork(void) { errno = ENOSYS; return -1; }
+int posix_openpt(int flags) { (void)flags; errno = ENOSYS; return -1; }
+int grantpt(int fd) { (void)fd; errno = ENOSYS; return -1; }
+int unlockpt(int fd) { (void)fd; errno = ENOSYS; return -1; }
+char *ptsname(int fd) { (void)fd; errno = ENOSYS; return NULL; }
 int fchdir(int fd) { (void)fd; errno = ENOSYS; return -1; }
 
 /* ---- command lines ---- */

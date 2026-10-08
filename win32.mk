@@ -96,6 +96,8 @@ TEST_SKIP += test/io_sysopen_flags.rb test/ffi_bool_return_low_byte.rb test/file
 TEST_SKIP += test/gem_rbconfig_stub.rb test/gem_toplevel_path.rb
 # winsock accepts a whole non-blocking send while its buffer has room
 TEST_SKIP += test/sp_net_write_partial.rb
+# no POSIX pseudo-terminals: PTY.spawn answers ENOSYS
+TEST_SKIP += packages/pty/test/pty_spawn.rb
 # tools/cident.sh, a POSIX shell tool: its forks run past the 10 s limit under MSYS2
 TEST_SKIP += test/tools_cident_abandoned.rb test/tools_cident_cache.rb test/tools_cident_concurrent.rb
 
