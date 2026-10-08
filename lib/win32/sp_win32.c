@@ -2506,6 +2506,7 @@ static void sp_w32_fault_run(sp_w32_fault *f) {
 }
 
 /* entered on the alternate stack, with the fault in sp_w32_cur_fault */
+static void sp_w32_dbg_say(const char *what, PEXCEPTION_POINTERS ep);
 static void sp_w32_fault_tramp(void) {
   sp_w32_fault *f = &sp_w32_cur_fault;
 #if defined(__aarch64__)
@@ -2628,9 +2629,28 @@ static int sp_w32_in_none(sp_w32_map *m, char *p) {
 
 static LONG sp_w32_fault_signal(PEXCEPTION_POINTERS ep);
 
+/* DEBUG (diag branch only): SP_W32_DEBUG=1 reports every exception */
+static int sp_w32_dbg = -1;
+static void sp_w32_dbg_say(const char *what, PEXCEPTION_POINTERS ep) {
+  if (sp_w32_dbg < 0) { const char *e = getenv("SP_W32_DEBUG"); sp_w32_dbg = e && *e; }
+  if (!sp_w32_dbg) return;
+  static char b[512];
+  NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+  void *dealloc = *(void **)((char *)NtCurrentTeb() + 0x1478);
+  int n = _snprintf(b, sizeof b - 1,
+    "[w32dbg] %s code=%08lx pc=%p info1=%p sp=%p tib.base=%p tib.limit=%p dealloc=%p\n",
+    what, ep ? (unsigned long)ep->ExceptionRecord->ExceptionCode : 0ul,
+    ep ? ep->ExceptionRecord->ExceptionAddress : NULL,
+    ep && ep->ExceptionRecord->NumberParameters > 1 ? (void *)ep->ExceptionRecord->ExceptionInformation[1] : NULL,
+    ep ? (void *)SP_W32_CTX_SP(*ep->ContextRecord) : NULL,
+    tib->StackBase, tib->StackLimit, dealloc);
+  DWORD w; if (n > 0) WriteFile(GetStdHandle(STD_ERROR_HANDLE), b, (DWORD)n, &w, NULL);
+}
+
 /* commit the granule around a first touch, clipped to the mapped part and
    short of any PROT_NONE page; any other fault is a signal (see below) */
 static LONG CALLBACK sp_w32_veh_handler(PEXCEPTION_POINTERS ep) {
+  sp_w32_dbg_say("veh", ep);
   if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
       ep->ExceptionRecord->NumberParameters < 2) return sp_w32_fault_signal(ep);
   char *addr = (char *)ep->ExceptionRecord->ExceptionInformation[1];

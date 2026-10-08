@@ -1,0 +1,58 @@
+name: Windows ARM64 diagnostics (fork only)
+
+on:
+  push:
+    branches: [win-arm64-test]
+
+jobs:
+  diag:
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true } catch {}
+          git config --global core.autocrlf false
+      - uses: actions/checkout@v6
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: false
+          install: >-
+            make diffutils curl tar git
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-ruby
+      - run: make deps && make -j$(nproc) all
+      - name: Diagnose
+        run: |
+          set +e +o pipefail
+          CDB=$(ls "/c/Program Files (x86)/Windows Kits/10/Debuggers/arm64/cdb.exe" 2>/dev/null)
+          echo "cdb: ${CDB:-none}"
+          ls "/c/Program Files (x86)/Windows Kits/10/Debuggers/" 2>&1 | head
+          NAT=$(ls packages/*/sp_*.o | grep -v _mt.o | tr '\n' ' ')
+          FLAGS="-Wno-all -ffp-contract=off -Ilib/win32 -D_FILE_OFFSET_BITS=64 -DWIN32_LEAN_AND_MEAN -D_WIN32_WINNT=0x0A00 -static -ffunction-sections -fdata-sections -Ilib"
+          LIBS="lib/libspinel_rt.a -static -lws2_32 -lbcrypt -lwinpthread -Llib/win32 -Wl,--stack,8388608 -lm -Wl,--gc-sections"
+          run() {  # run <name> <opt>
+            t=$1; o=$2
+            bin/spinel test/$t.rb -c --no-line-map -o /tmp/$t.c >/dev/null
+            clang $o -g -gcodeview $FLAGS /tmp/$t.c $NAT $LIBS -Wl,--pdb=/tmp/$t$o.pdb -o /tmp/$t$o.exe
+            SP_W32_DEBUG=1 /tmp/$t$o.exe > /tmp/$t$o.out 2>/tmp/$t$o.err; rc=$?
+            echo "=== $t $o: rc=$rc, $(wc -l < /tmp/$t$o.out) of $(wc -l < test/$t.rb.expected) lines"
+            grep w32dbg /tmp/$t$o.err | grep -v 'code=c0000005' | head -8
+            echo "  AVs: $(grep -c 'code=c0000005' /tmp/$t$o.err); last: $(grep w32dbg /tmp/$t$o.err | tail -1)"
+            if [ $rc -ne 0 ] && [ -n "$CDB" ]; then
+              W=$(cygpath -w /tmp/$t$o.exe)
+              "$CDB" -g -xd av -xd sov -xd gp -y "$(cygpath -w /tmp)" -c ".lastevent; r; kn 25; q" "$W" 2>&1 | grep -vE '^(Symbol search|Executable search|ModLoad|\*\*\*|Microsoft|Copyright|CommandLine|Response|Time Travel|  )' | tail -60
+            fi
+          }
+          run builtins_inject -O0
+          run nil_narrowing -O0
+          run stack_overflow_rescued -O1
+          make -s lib/libspinel_rt.a >/dev/null
+          for t in tools_alloc_diff tools_repr_diff builtins_inject method_chain_long stack_overflow_rescued pkg.csv.csv_parse; do
+            case $t in pkg.*) p=${t#pkg.}; target=build/test-results/pkg.$p.ok ;; *) target=build/test-results/$t.ok ;; esac
+            rm -f $target; s=$(date +%s); make $target OPT=-O1 >/dev/null 2>&1; echo "harness $t: $(cat $target 2>/dev/null) in $(( $(date +%s) - s ))s"
+          done
