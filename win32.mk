@@ -15,9 +15,9 @@
 # `make all`
 .DEFAULT_GOAL := all
 
-# there is no `cc`
+# there is no `cc`: gcc, or clang in MSYS2's ARM64 environment (CLANGARM64)
 ifeq ($(origin CC),default)
-  CC = gcc
+  CC = $(if $(filter CLANGARM64,$(MSYSTEM)),clang,gcc)
 endif
 
 # the shim's headers first; 64-bit st_size and offsets; no winsock.h through
@@ -34,6 +34,12 @@ endif
 PLATFORM_HDRS  = $(wildcard lib/win32/*.h lib/win32/*/*.h)
 # the winsock and CNG import libraries the shim calls
 PLATFORM_LIBS  = -lws2_32 -lbcrypt -lwinpthread
+# clang predefines __STATIC__ under -static, which the link line carries: a
+# precompiled header built without it is refused where a test is compiled and
+# linked in one step, so every clang compile gets it
+ifneq ($(findstring clang,$(CC)),)
+  PLATFORM_FLAGS += -static
+endif
 
 PLATFORM_SRC    = lib/win32/sp_win32.c lib/win32/sp_win32_net.c lib/win32/sp_win32_ctx.c lib/win32/sp_win32_crypt.c lib/win32/sp_win32_driver.c
 PLATFORM_OBJ    = $(patsubst lib/win32/%.c,build/win32/%.o,$(PLATFORM_SRC))

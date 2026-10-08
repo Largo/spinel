@@ -1,4 +1,4 @@
-/* sp_win32_ctx.c -- the coroutine context switch for Windows x64, behind
+/* sp_win32_ctx.c -- the coroutine context switch for Windows x64 and ARM64, behind
    <ucontext.h> (ucontext.h here), which the runtime's coroutine fallback
    calls (lib/sp_fiber_ctx.h).
 
@@ -20,8 +20,21 @@
      +16  StackBase           gs:[0x08]
      +24  xmm6 .. xmm15       10 x 16 bytes
      +184 r15 r14 r13 r12 rsi rdi rbx rbp
-     +248 return address */
-#if defined(_WIN64) && defined(__x86_64__)
+     +248 return address
+
+   On ARM64 the arguments come in x0/x1, a call keeps x19-x28, the frame
+   pointer, the link register and d8-d15, and x18 holds the TEB (the same
+   64-bit TEB as x64's, with the same offsets), which nothing here may
+   change. The frame there, from the saved stack pointer up (sp stays
+   16-aligned throughout):
+     +0   x19 x20 .. x27 x28  10 x 8 bytes
+     +80  x29 (fp) x30 (lr)   the switch returns through lr
+     +96  d8 .. d15           8 x 8 bytes
+     +160 StackBase           [x18, #0x08]
+     +168 StackLimit          [x18, #0x10]
+     +176 DeallocationStack   [x18, #0x1478]
+     +184 (padding) */
+#if defined(_WIN64) && (defined(__x86_64__) || defined(__aarch64__))
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -32,6 +45,7 @@
 #include <errno.h>
 #include <ucontext.h>
 
+#if defined(__x86_64__)
 __asm__(
   ".text\n"
   ".globl sp_w32_swapcontext\n"
@@ -64,6 +78,43 @@ __asm__(
   "  xorl %eax, %eax\n"          /* swapcontext answers 0 */
   "  ret\n"
 );
+#else
+__asm__(
+  ".text\n"
+  ".globl sp_w32_swapcontext\n"
+  ".def sp_w32_swapcontext; .scl 2; .type 32; .endef\n"
+  ".p2align 2\n"
+  "sp_w32_swapcontext:\n"
+  "  sub sp, sp, #192\n"
+  "  stp x19, x20, [sp, #0]\n   stp x21, x22, [sp, #16]\n"
+  "  stp x23, x24, [sp, #32]\n  stp x25, x26, [sp, #48]\n"
+  "  stp x27, x28, [sp, #64]\n  stp x29, x30, [sp, #80]\n"
+  "  stp d8,  d9,  [sp, #96]\n  stp d10, d11, [sp, #112]\n"
+  "  stp d12, d13, [sp, #128]\n stp d14, d15, [sp, #144]\n"
+  "  ldr x9,  [x18, #0x08]\n"    /* StackBase */
+  "  ldr x10, [x18, #0x10]\n"    /* StackLimit */
+  "  ldr x11, [x18, #0x1478]\n"  /* DeallocationStack */
+  "  stp x9, x10, [sp, #160]\n"
+  "  str x11, [sp, #176]\n"
+  "  mov x9, sp\n"
+  "  str x9, [x0]\n"             /* from->sp = sp */
+  "  ldr x9, [x1]\n"
+  "  mov sp, x9\n"               /* sp = to->sp */
+  "  ldp x9, x10, [sp, #160]\n"
+  "  ldr x11, [sp, #176]\n"
+  "  str x9,  [x18, #0x08]\n"
+  "  str x10, [x18, #0x10]\n"
+  "  str x11, [x18, #0x1478]\n"
+  "  ldp x19, x20, [sp, #0]\n   ldp x21, x22, [sp, #16]\n"
+  "  ldp x23, x24, [sp, #32]\n  ldp x25, x26, [sp, #48]\n"
+  "  ldp x27, x28, [sp, #64]\n  ldp x29, x30, [sp, #80]\n"
+  "  ldp d8,  d9,  [sp, #96]\n  ldp d10, d11, [sp, #112]\n"
+  "  ldp d12, d13, [sp, #128]\n ldp d14, d15, [sp, #144]\n"
+  "  add sp, sp, #192\n"
+  "  mov w0, #0\n"               /* swapcontext answers 0 */
+  "  ret\n"
+);
+#endif
 
 /* A context makecontext can prime: the stack it runs on is the caller's to
    set in uc_stack afterwards, as POSIX has it. */
@@ -89,6 +140,7 @@ void sp_w32_makecontext(ucontext_t *uc, void (*fn)(void), int argc, ...) {
     dealloc = mbi.AllocationBase;
     limit = mbi.State == MEM_COMMIT ? mbi.BaseAddress : (void *)top;
   }
+#if defined(__x86_64__)
   /* fn's first instruction sees rsp % 16 == 8, as after a call, with its
      32 bytes of home space above the return slot */
   uintptr_t ret_slot = top - 48;
@@ -98,6 +150,16 @@ void sp_w32_makecontext(ucontext_t *uc, void (*fn)(void), int argc, ...) {
   s[1] = limit;
   s[2] = (void *)top;
   s[31] = (void *)fn;   /* +248 */
+#else
+  /* the switch returns through the saved lr into fn, with sp at the top
+     (16-aligned) and fp 0, the end of the frame chain */
+  void **s = (void **)(top - 192);
+  memset(s, 0, 192);
+  s[11] = (void *)fn;     /* +88:  x30 */
+  s[20] = (void *)top;    /* +160: StackBase */
+  s[21] = limit;          /* +168: StackLimit */
+  s[22] = dealloc;        /* +176: DeallocationStack */
+#endif
   uc->sp = s;
 }
 #endif

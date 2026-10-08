@@ -2,7 +2,7 @@
    (sp_win32_ctx.c), which the runtime's coroutines take there (see
    lib/sp_fiber_ctx.h). makecontext lays out a fresh stack for its entry
    function and swapcontext moves between contexts, saving what the
-   Windows x64 ABI preserves across a call and the stack bounds the
+   Windows x64 or ARM64 ABI preserves across a call and the stack bounds the
    thread's TEB holds. getcontext prepares a context for makecontext; it
    does not capture the caller's state for a later setcontext, which
    nothing here asks of it. */
