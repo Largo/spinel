@@ -2272,6 +2272,18 @@ static void CALLBACK sp_w32_apc(ULONG_PTR sig) {
   sp_w32_deliver((int)sig);
 }
 
+/* the stack pointer, the program counter and the first argument register,
+   as a CONTEXT names them on x64 and on ARM64 */
+#if defined(__aarch64__)
+#define SP_W32_CTX_SP(c)   ((c).Sp)
+#define SP_W32_CTX_PC(c)   ((c).Pc)
+#define SP_W32_CTX_ARG0(c) ((c).X0)
+#else
+#define SP_W32_CTX_SP(c)   ((c).Rsp)
+#define SP_W32_CTX_PC(c)   ((c).Rip)
+#define SP_W32_CTX_ARG0(c) ((c).Rcx)
+#endif
+
 typedef struct { CONTEXT ctx; int sig; } sp_w32_hijack;
 static void sp_w32_hijack_entry(sp_w32_hijack *h) {
   CONTEXT c = h->ctx;
@@ -2293,14 +2305,19 @@ static void sp_w32_async(int sig) {
   if (!GetThreadContext(sp_w32_main_thread, &h->ctx)) { ResumeThread(sp_w32_main_thread); free(h); return; }
   h->sig = sig;
   CONTEXT c = h->ctx;
-  /* below the interrupted frame (and any red zone), 16-aligned, with the
-     return slot and home space a call would leave */
-  DWORD64 sp = (c.Rsp - 256) & ~(DWORD64)15;
+  /* below the interrupted frame (and any red zone), 16-aligned, with what
+     a call would leave: on x64 the return slot and home space, on ARM64
+     only the link register */
+  DWORD64 sp = (SP_W32_CTX_SP(c) - 256) & ~(DWORD64)15;
+#if defined(__aarch64__)
+  c.Lr = 0;
+#else
   sp -= 40;
   *(DWORD64 *)sp = 0;
-  c.Rsp = sp;
-  c.Rip = (DWORD64)(uintptr_t)sp_w32_hijack_entry;
-  c.Rcx = (DWORD64)(uintptr_t)h;
+#endif
+  SP_W32_CTX_SP(c) = sp;
+  SP_W32_CTX_PC(c) = (DWORD64)(uintptr_t)sp_w32_hijack_entry;
+  SP_W32_CTX_ARG0(c) = (DWORD64)(uintptr_t)h;
   SetThreadContext(sp_w32_main_thread, &c);
   ResumeThread(sp_w32_main_thread);
 }
@@ -2443,6 +2460,9 @@ typedef struct {
   siginfo_t si;
   CONTEXT ctx;
   int overflow;
+#if defined(__aarch64__)
+  void *tib_base, *tib_limit;   /* the thread's TEB bounds, for the trampoline to put back */
+#endif
 } sp_w32_fault;
 static __thread sp_w32_fault sp_w32_cur_fault;
 
@@ -2488,7 +2508,10 @@ static void sp_w32_fault_run(sp_w32_fault *f) {
 /* entered on the alternate stack, with the fault in sp_w32_cur_fault */
 static void sp_w32_fault_tramp(void) {
   sp_w32_fault *f = &sp_w32_cur_fault;
-  if (f->overflow) sp_w32_rearm_guard((char *)f->ctx.Rsp);
+#if defined(__aarch64__)
+  { NT_TIB *tib = (NT_TIB *)NtCurrentTeb(); tib->StackBase = f->tib_base; tib->StackLimit = f->tib_limit; }
+#endif
+  if (f->overflow) sp_w32_rearm_guard((char *)SP_W32_CTX_SP(f->ctx));
   sp_w32_fault_run(f);
   RtlRestoreContext(&f->ctx, NULL);
 }
@@ -2505,7 +2528,7 @@ static LONG sp_w32_fault_signal(PEXCEPTION_POINTERS ep) {
     case EXCEPTION_STACK_OVERFLOW:
       /* the address is where the stack ran out: the stack pointer, just
          above the stack's reserved bottom */
-      sig = SIGSEGV; overflow = 1; addr = (void *)ep->ContextRecord->Rsp;
+      sig = SIGSEGV; overflow = 1; addr = (void *)SP_W32_CTX_SP(*ep->ContextRecord);
       break;
     case EXCEPTION_IN_PAGE_ERROR: sig = SIGBUS; break;
     case EXCEPTION_ILLEGAL_INSTRUCTION: case EXCEPTION_PRIV_INSTRUCTION: sig = SIGILL; break;
@@ -2529,11 +2552,23 @@ static LONG sp_w32_fault_signal(PEXCEPTION_POINTERS ep) {
   struct sigaction *a = &sp_w32_sigs[sig];
   if ((a->sa_flags & SA_ONSTACK) && sp_w32_altstack.ss_sp && !(sp_w32_altstack.ss_flags & SS_DISABLE)) {
     /* resume on the alternate stack, in the trampoline: entry as after a
-       call (rsp % 16 == 8), its home space above the return slot */
+       call -- on x64 rsp % 16 == 8, its home space above the return slot;
+       on ARM64 sp 16-aligned and no return address but lr's */
     uintptr_t top = ((uintptr_t)sp_w32_altstack.ss_sp + sp_w32_altstack.ss_size) & ~(uintptr_t)15;
+#if defined(__aarch64__)
+    ep->ContextRecord->Sp = (DWORD64)top;
+    ep->ContextRecord->Lr = 0;
+    /* ARM64 Windows refuses to resume a thread whose sp is outside the
+       TEB's stack bounds (x64 does not check): the process dies of the
+       overflow it was handling. So the bounds name the alternate stack
+       until the trampoline runs, which puts the thread's own back */
+    { NT_TIB *tib = (NT_TIB *)NtCurrentTeb(); f->tib_base = tib->StackBase; f->tib_limit = tib->StackLimit;
+      tib->StackBase = (void *)top; tib->StackLimit = sp_w32_altstack.ss_sp; }
+#else
     ep->ContextRecord->Rsp = (DWORD64)(top - 40);
     *(void **)(top - 40) = NULL;
-    ep->ContextRecord->Rip = (DWORD64)(uintptr_t)sp_w32_fault_tramp;
+#endif
+    SP_W32_CTX_PC(*ep->ContextRecord) = (DWORD64)(uintptr_t)sp_w32_fault_tramp;
     return EXCEPTION_CONTINUE_EXECUTION;
   }
   if (overflow) return EXCEPTION_CONTINUE_SEARCH;   /* no stack to run a handler on */

@@ -4,8 +4,9 @@
  * Usage: spinel-timeout SECONDS COMMAND [ARG...]
  *
  * The command runs on this process's standard handles; one that runs past
- * SECONDS is terminated and the wrapper answers 124, as GNU timeout does,
- * otherwise the command's own exit status. win32.mk builds this in place of
+ * SECONDS (times $SPINEL_TIMEOUT_SCALE, see main) is terminated and the
+ * wrapper answers 124, as GNU timeout does, otherwise the command's own exit
+ * status. win32.mk builds this in place of
  * scripts/spinel-timeout.c. */
 /* Arguments are re-quoted the way the MSVC runtime splits a command line,
    and a program named without an extension is the .exe beside the name
@@ -41,6 +42,17 @@ int wmain(int argc, wchar_t **argv) {
   }
   long secs = wcstol(argv[1], NULL, 10);
   if (secs <= 0) secs = 1;
+  /* SPINEL_TIMEOUT_SCALE=<n> multiplies every limit. On ARM64 it is 3
+     unless set: MSYS2's sh, make and the other tools are x64 programs
+     there, run emulated, and a test that drives the toolchain starts
+     dozens of them (tools_alloc_diff takes 22 s on GitHub's runner) */
+  long scale = 1;
+#if defined(__aarch64__)
+  scale = 3;
+#endif
+  const wchar_t *sc = _wgetenv(L"SPINEL_TIMEOUT_SCALE");
+  if (sc && *sc && wcstol(sc, NULL, 10) > 0) scale = wcstol(sc, NULL, 10);
+  secs *= scale;
   size_t cap = 64;
   for (int i = 2; i < argc; i++) cap += wcslen(argv[i]) * 2 + 3;
   wchar_t *cmd = (wchar_t *)malloc(sizeof(wchar_t) * cap);

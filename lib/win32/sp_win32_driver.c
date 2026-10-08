@@ -29,23 +29,32 @@ static int sp_w32_drv_file(const wchar_t *p) {
   return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-/* <root>\msys64\ucrt64\bin when it holds a gcc: RubyInstaller's Devkit
-   layout (and MSYS2's own, with <root> its parent). The UCRT64 one: the
-   runtime archive is built against the UCRT, and a MINGW64 gcc links
-   msvcrt. */
+/* the MSYS2 environment whose compiler links what this build made, and
+   that compiler: UCRT64's gcc (a MINGW64 gcc links msvcrt, and the runtime
+   archive is built against the UCRT), or on ARM64 CLANGARM64's clang */
+#if defined(__aarch64__)
+#define SP_W32_DRV_ENV L"clangarm64"
+#define SP_W32_DRV_CC  L"clang.exe"
+#else
+#define SP_W32_DRV_ENV L"ucrt64"
+#define SP_W32_DRV_CC  L"gcc.exe"
+#endif
+
+/* <root>\msys64\<env>\bin when it holds that compiler: RubyInstaller's
+   Devkit layout (and MSYS2's own, with <root> its parent) */
 static int sp_w32_drv_devkit(const wchar_t *root, wchar_t *bin, size_t cap) {
-  _snwprintf(bin, cap, L"%ls\\msys64\\ucrt64\\bin", root);
+  _snwprintf(bin, cap, L"%ls\\msys64\\" SP_W32_DRV_ENV L"\\bin", root);
   bin[cap - 1] = 0;
-  wchar_t gcc[MAX_PATH * 2];
-  _snwprintf(gcc, MAX_PATH * 2, L"%ls\\gcc.exe", bin);
-  gcc[MAX_PATH * 2 - 1] = 0;
-  return sp_w32_drv_file(gcc);
+  wchar_t cc[MAX_PATH * 2];
+  _snwprintf(cc, MAX_PATH * 2, L"%ls\\" SP_W32_DRV_CC, bin);
+  cc[MAX_PATH * 2 - 1] = 0;
+  return sp_w32_drv_file(cc);
 }
 
-/* the gcc to use when PATH has none: the Devkit beside the ruby on PATH,
+/* the compiler to use when PATH has none: the Devkit beside the ruby on PATH,
    then the installs RubyInstaller records in the registry, then MSYS2's
    default C:\msys64 */
-static int sp_w32_drv_find_gcc(wchar_t *bin, size_t cap) {
+static int sp_w32_drv_find_cc(wchar_t *bin, size_t cap) {
   wchar_t ruby[MAX_PATH * 2];
   DWORD n = SearchPathW(NULL, L"ruby.exe", NULL, MAX_PATH * 2, ruby, NULL);
   if (n > 0 && n < MAX_PATH * 2) {
@@ -79,7 +88,7 @@ static int sp_w32_drv_find_gcc(wchar_t *bin, size_t cap) {
 
 void sp_w32_driver_init(void) {
   /* the temporary directory the driver writes the C into: a POSIX-spelled
-     $TMPDIR (an MSYS2 shell's /tmp) means nothing to gcc, so %TEMP% */
+     $TMPDIR (an MSYS2 shell's /tmp) means nothing to the compiler, so %TEMP% */
   const char *t = getenv("TMPDIR");
   if (!t || !*t || t[0] == '/') {
     const char *w = getenv("TEMP");
@@ -89,11 +98,11 @@ void sp_w32_driver_init(void) {
       if (d) { _putenv_s("TMPDIR", d); free(d); }
     }
   }
-  /* gcc: RubyInstaller puts its Devkit on PATH only under `ridk enable` */
+  /* the compiler: RubyInstaller puts its Devkit on PATH only under `ridk enable` */
   wchar_t found[MAX_PATH * 2];
-  if (SearchPathW(NULL, L"gcc.exe", NULL, MAX_PATH * 2, found, NULL) > 0) return;
+  if (SearchPathW(NULL, SP_W32_DRV_CC, NULL, MAX_PATH * 2, found, NULL) > 0) return;
   wchar_t bin[MAX_PATH * 2];
-  if (!sp_w32_drv_find_gcc(bin, MAX_PATH * 2)) return;
+  if (!sp_w32_drv_find_cc(bin, MAX_PATH * 2)) return;
   const wchar_t *old = _wgetenv(L"PATH");
   size_t len = wcslen(bin) + (old ? wcslen(old) : 0) + 2;
   wchar_t *np = (wchar_t *)malloc(sizeof(wchar_t) * len);
