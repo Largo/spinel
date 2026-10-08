@@ -98,6 +98,10 @@ TEST_SKIP += test/gem_rbconfig_stub.rb test/gem_toplevel_path.rb
 TEST_SKIP += test/sp_net_write_partial.rb
 # no POSIX pseudo-terminals: PTY.spawn answers ENOSYS
 TEST_SKIP += packages/pty/test/pty_spawn.rb
+# LLP64: a long is 4 bytes beside an 8-byte pointer (CRuby answers the same)
+TEST_SKIP += test/array_pack_native_ints.rb
+# no /etc/hosts naming 127.0.0.1 localhost: Windows answers the computer's name
+TEST_SKIP += test/socket_do_not_reverse_lookup.rb
 # tools/cident.sh, a POSIX shell tool: its forks run past the 10 s limit under MSYS2
 TEST_SKIP += test/tools_cident_abandoned.rb test/tools_cident_cache.rb test/tools_cident_concurrent.rb
 
