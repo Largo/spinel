@@ -134,11 +134,25 @@ void sp_w32_makecontext(ucontext_t *uc, void (*fn)(void), int argc, ...) {
   (void)argc;
   char *base = (char *)uc->uc_stack.ss_sp;
   uintptr_t top = ((uintptr_t)base + uc->uc_stack.ss_size) & ~(uintptr_t)15;
-  void *dealloc = base, *limit = base;
+  void *dealloc = base, *limit = (void *)top;
   MEMORY_BASIC_INFORMATION mbi;
   if (VirtualQuery((void *)(top - 1), &mbi, sizeof mbi)) {
     dealloc = mbi.AllocationBase;
-    limit = mbi.State == MEM_COMMIT ? mbi.BaseAddress : (void *)top;
+    /* the committed run the top is in starts where the walk up from the
+       reservation's start first meets committed memory that is not the
+       guard page; VirtualQuery at the top itself names only the top page.
+       ARM64 Windows checks a resumed thread's sp against StackLimit, so a
+       limit too high there ended a program whose frames had gone below it
+       at the first exception it continued from (an -O0 build's) */
+    for (char *p = (char *)dealloc; p < (char *)top; ) {
+      if (!VirtualQuery(p, &mbi, sizeof mbi)) break;
+      char *end = (char *)mbi.BaseAddress + mbi.RegionSize;
+      if (mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) && end >= (char *)top) {
+        limit = mbi.BaseAddress;
+        break;
+      }
+      p = end;
+    }
   }
 #if defined(__x86_64__)
   /* fn's first instruction sees rsp % 16 == 8, as after a call, with its
