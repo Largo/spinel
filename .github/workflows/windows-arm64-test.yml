@@ -1,0 +1,100 @@
+name: Windows ARM64 (fork test)
+
+# A test lane for the fork only, not for upstream: the compiler, the runtime
+# and the corpus built and run natively on Windows 11 ARM64 with MSYS2's
+# CLANGARM64 clang (see lib/win32). The corpus is split across three jobs,
+# as the old x64 Windows lane split it.
+
+on:
+  push:
+    branches: [win-arm64]
+  workflow_dispatch:
+
+concurrency:
+  group: windows-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arm64:
+    name: windows-11-arm / clang (clangarm64) (${{ matrix.shard }}/3)
+    runs-on: windows-11-arm
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Disable Defender real-time monitoring
+        shell: pwsh
+        run: |
+          try { Set-MpPreference -DisableRealtimeMonitoring $true }
+          catch { Write-Host "Could not disable Defender real-time monitoring: $_" }
+
+      # The corpus and its .expected files are LF; a CRLF checkout would put
+      # a \r into every heredoc a test prints.
+      - name: Check out with LF line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+
+      - name: Set up MSYS2 (CLANGARM64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: false
+          install: >-
+            make
+            diffutils
+            curl
+            tar
+            git
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-ruby
+
+      - name: Show toolchain
+        run: |
+          uname -a
+          echo "MSYSTEM=$MSYSTEM"
+          clang --version | head -2
+          make --version | head -1
+          ruby --version
+
+      - name: Fetch libprism sources
+        run: make deps
+
+      - name: Build (compiler, runtime, tools)
+        run: make -j$(nproc) all
+
+      # the parts a cross-compile cannot check: fibers (the context switch),
+      # a raise across them, threads, and a deep recursion's SystemStackError
+      - name: Smoke test
+        continue-on-error: true
+        run: |
+          file bin/spinel.exe
+          cat > /tmp/smoke.rb <<'RB'
+          f = Fiber.new { |x| y = Fiber.yield(x + 1); y * 2 }
+          p f.resume(1), f.resume(10)
+          e = Enumerator.new { |y| 3.times { |i| y << i } }
+          p e.next, e.next, e.next
+          begin
+            Fiber.new { raise ArgumentError, "in fiber" }.resume
+          rescue ArgumentError => ex
+            p ex.message
+          end
+          p 4.times.map { |i| Thread.new { i * i } }.map(&:value)
+          def deep(n) = n == 0 ? 0 : 1 + deep(n - 1)
+          begin
+            deep(10_000_000)
+          rescue SystemStackError
+            p :stack_error
+          end
+          RB
+          bin/spinel /tmp/smoke.rb -o /tmp/smoke
+          /tmp/smoke.exe
+
+      - name: Run the test corpus
+        run: make -j$(nproc) test-corpus TEST_SHARD=${{ matrix.shard }}/3 OPT=-O1
